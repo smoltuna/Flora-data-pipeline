@@ -1,4 +1,4 @@
-"""End-to-end pipeline: seed → data (scrape/RAG/translate) → images.
+"""End-to-end pipeline: seed → data (scrape/RAG/translate) → images → xcassets.
 
 Edit the FLOWERS list below or pass overrides on the command line.
 
@@ -6,15 +6,17 @@ Usage:
   uv run python scripts/run_all.py                  # process FLOWERS list
   uv run python scripts/run_all.py --name "Rosa canina"
   uv run python scripts/run_all.py --file flowers.txt
+  uv run python scripts/run_all.py --limit 5        # first N pending flowers in DB
   uv run python scripts/run_all.py --skip-images    # data pipeline only
+  uv run python scripts/run_all.py --skip-data      # images only (flowers must be enriched)
 """
 from __future__ import annotations
 
 # ── Flowers to process ───────────────────────────────────────────────────────
 FLOWERS = [
     "Iris germanica",
-    "Papaver orientale",
-    "Nymphaea alba"
+    "Papaver orientale"
+    # "Nymphaea alba"
 ]
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -88,16 +90,33 @@ async def _run_images(flower: Flower, session) -> None:
     await session.commit()
 
 
-async def _load_flowers(latin_names: list[str] | None) -> list[Flower]:
+ENRICHED_STATUSES = ("enriched", "images_done", "complete")
+
+
+async def _load_flowers(
+    latin_names: list[str] | None,
+    limit: int | None = None,
+    skip_data: bool = False,
+) -> list[Flower]:
     async with async_session_factory() as session:
         if latin_names:
             result = await session.execute(
                 select(Flower).where(Flower.latin_name.in_(latin_names))
             )
-        else:
-            result = await session.execute(
-                select(Flower).where(Flower.status == "pending").order_by(Flower.id)
+        elif skip_data:
+            q = (
+                select(Flower)
+                .where(Flower.status.in_(ENRICHED_STATUSES))
+                .order_by(Flower.id)
             )
+            if limit:
+                q = q.limit(limit)
+            result = await session.execute(q)
+        else:
+            q = select(Flower).where(Flower.status == "pending").order_by(Flower.id)
+            if limit:
+                q = q.limit(limit)
+            result = await session.execute(q)
         return result.scalars().all()
 
 
@@ -111,21 +130,23 @@ def _eta(elapsed: float, done: int, total: int) -> float | None:
 async def main(
     latin_names: list[str] | None,
     skip_images: bool,
+    skip_data: bool = False,
+    limit: int | None = None,
 ) -> None:
     configure_logging()
     await create_tables()
 
-    if latin_names:
+    if latin_names and not skip_data:
         await _seed(latin_names)
 
-    flowers = await _load_flowers(latin_names)
+    flowers = await _load_flowers(latin_names, limit=limit, skip_data=skip_data)
     total = len(flowers)
 
     if total == 0:
         log.info("run_all.nothing_to_do")
         return
 
-    log.info("run_all.start", n_flowers=total, skip_images=skip_images)
+    log.info("run_all.start", n_flowers=total, skip_images=skip_images, skip_data=skip_data)
     data_ok = data_fail = img_ok = img_fail = 0
     batch_start = time.perf_counter()
 
@@ -137,29 +158,30 @@ async def main(
             latin_name=flower.latin_name,
             progress=f"{index}/{total}",
             feature_date=str(feature_date),
-            eta_s=_eta(elapsed, data_ok + data_fail, total),
+            eta_s=_eta(elapsed, data_ok + data_fail + img_ok + img_fail, total),
         )
 
         # ── Stage 1: Data pipeline ──────────────────────────────────────────
-        step_start = time.perf_counter()
-        async with async_session_factory() as session:
-            try:
-                await run_pipeline(flower.id, session, feature_date=feature_date)
-                data_ok += 1
-                log.info(
-                    "run_all.data_done",
-                    latin_name=flower.latin_name,
-                    elapsed_s=round(time.perf_counter() - step_start, 1),
-                )
-            except Exception as exc:
-                data_fail += 1
-                log.error(
-                    "run_all.data_error",
-                    latin_name=flower.latin_name,
-                    error=str(exc),
-                    exc_type=type(exc).__name__,
-                )
-                continue  # skip images if data failed
+        if not skip_data:
+            step_start = time.perf_counter()
+            async with async_session_factory() as session:
+                try:
+                    await run_pipeline(flower.id, session, feature_date=feature_date)
+                    data_ok += 1
+                    log.info(
+                        "run_all.data_done",
+                        latin_name=flower.latin_name,
+                        elapsed_s=round(time.perf_counter() - step_start, 1),
+                    )
+                except Exception as exc:
+                    data_fail += 1
+                    log.error(
+                        "run_all.data_error",
+                        latin_name=flower.latin_name,
+                        error=str(exc),
+                        exc_type=type(exc).__name__,
+                    )
+                    continue  # skip images if data failed
 
         if skip_images:
             continue
@@ -169,6 +191,13 @@ async def main(
         async with async_session_factory() as session:
             try:
                 f = await session.get(Flower, flower.id)
+                if f.status not in ENRICHED_STATUSES:
+                    log.warning(
+                        "run_all.images_skip",
+                        latin_name=flower.latin_name,
+                        reason=f"status={f.status!r} — must be enriched first",
+                    )
+                    continue
                 await _run_images(f, session)
                 img_ok += 1
                 log.info(
@@ -211,13 +240,24 @@ async def main(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="End-to-end Flora pipeline")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--name", type=str, help="Single Latin name")
-    group.add_argument("--file", type=Path, help="Text file with one Latin name per line")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--name", type=str, help="Single Latin name")
+    source.add_argument("--file", type=Path, help="Text file with one Latin name per line")
     parser.add_argument(
+        "--limit",
+        type=int,
+        help="Process the first N matching flowers in the database",
+    )
+    stage = parser.add_mutually_exclusive_group()
+    stage.add_argument(
         "--skip-images",
         action="store_true",
         help="Run data pipeline only (scrape/RAG/translate), skip image generation",
+    )
+    stage.add_argument(
+        "--skip-data",
+        action="store_true",
+        help="Run image pipeline only (flowers must already be enriched)",
     )
     return parser.parse_args()
 
@@ -229,7 +269,9 @@ if __name__ == "__main__":
         names: list[str] | None = [args.name]
     elif args.file:
         names = args.file.read_text().splitlines()
+    elif args.limit or args.skip_data:
+        names = None
     else:
         names = FLOWERS
 
-    asyncio.run(main(names, skip_images=args.skip_images))
+    asyncio.run(main(names, skip_images=args.skip_images, skip_data=args.skip_data, limit=args.limit))

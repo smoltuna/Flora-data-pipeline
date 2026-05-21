@@ -111,8 +111,14 @@ Services started:
 # Data only (no fal.ai key needed)
 .venv/bin/python scripts/run_all.py --skip-images
 
+# Images only (flowers must already be enriched)
+.venv/bin/python scripts/run_all.py --skip-data
+
 # Single flower
 .venv/bin/python scripts/run_all.py --name "Rosa canina"
+
+# First N pending flowers from the database
+.venv/bin/python scripts/run_all.py --limit 5
 ```
 
 Edit the `FLOWERS` list at the top of `scripts/run_all.py` to change which flowers are processed. Default demo flowers are in `data/demo_flowers.txt`.
@@ -148,12 +154,10 @@ Open [http://localhost:3000](http://localhost:3000) — inspect confidence score
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/run_all.py` | **Recommended.** Full pipeline: seed → data → images → xcassets export |
-| `scripts/run_data_pipeline.py` | Data only (scrape → RAG → translate). No images, no fal.ai needed |
-| `scripts/run_image_pipeline.py` | Images only. Flower must already be enriched |
+| `scripts/run_all.py` | Full pipeline: seed → data → images → xcassets export |
 | `scripts/start_services.sh` | Start Docker services with preflight checks (`--no-ui`, `--stop`) |
 
-All scripts accept `--name "Latin name"`, `--file flowers.txt`, or `--limit N` to select flowers.
+`run_all.py` flags: `--name "Latin name"`, `--file flowers.txt`, `--limit N`, `--skip-images` (data only), `--skip-data` (images only, flowers must be enriched).
 
 ---
 
@@ -210,9 +214,7 @@ Flora-Asset-Pipeline/
 ├── data/
 │   └── demo_flowers.txt         # 15 botanically diverse demo entries
 ├── scripts/
-│   ├── run_all.py               # Full pipeline (recommended entry point)
-│   ├── run_data_pipeline.py     # Data pipeline only
-│   ├── run_image_pipeline.py    # Image pipeline only
+│   ├── run_all.py               # Full pipeline (--skip-images, --skip-data, --limit)
 │   └── start_services.sh        # Docker service startup with preflight checks
 ├── infra/
 │   └── ollama-entrypoint.sh     # Pulls llama3.2:3b + nomic-embed-text on container start
