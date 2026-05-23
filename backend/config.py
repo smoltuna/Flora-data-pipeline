@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     # fal.ai (vision judge + FLUX lock icon generation)
     fal_key: str = ""
 
+    # Web search (5th source — DuckDuckGo + httpx/bs4)
+    web_search_enabled: bool = True
+
+    # Chunking config (Session 3)
+    chunk_size: int = 500
+    chunk_overlap: int = 50
+
     # MLflow
     mlflow_tracking_uri: str = "http://localhost:5001"
 

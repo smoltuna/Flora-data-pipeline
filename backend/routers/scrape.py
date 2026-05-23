@@ -9,6 +9,7 @@ from models import Flower, RawSource
 from pydantic import BaseModel
 from services.scraper.gbif import fetch_gbif
 from services.scraper.pfaf import scrape_pfaf
+from services.scraper.web_search import search_web
 from services.scraper.wikidata import fetch_wikidata
 from services.scraper.wikipedia import fetch_wikipedia
 from sqlalchemy import select
@@ -68,13 +69,14 @@ async def _do_scrape(flower_id: int, latin_name: str, db: AsyncSession) -> Scrap
     scraped: list[str] = []
     failed: list[str] = []
 
-    # Run all 4 scrapers concurrently. PFAF has a 2-sec courtesy delay internally,
-    # but it now overlaps with the other 3 sources, cutting total scrape time to ~2-3s.
-    pfaf_res, wiki_res, wd_res, gbif_res = await asyncio.gather(
+    # Run all 5 scrapers concurrently. PFAF has a 2-sec courtesy delay internally,
+    # but it now overlaps with the other sources, cutting total scrape time to ~2-3s.
+    pfaf_res, wiki_res, wd_res, gbif_res, web_res = await asyncio.gather(
         scrape_pfaf(latin_name),
         fetch_wikipedia(latin_name),
         fetch_wikidata(latin_name),
         fetch_gbif(latin_name),
+        search_web(latin_name),
         return_exceptions=True,
     )
 
@@ -173,6 +175,28 @@ async def _do_scrape(flower_id: int, latin_name: str, db: AsyncSession) -> Scrap
             scraped.append("gbif")
         except Exception:
             failed.append("gbif")
+
+    # Tavily web search — multiple results stored with indexed source names
+    if isinstance(web_res, BaseException):
+        failed.append("web_ddg")
+    else:
+        web_results = web_res or []
+        stored_count = 0
+        for i, result in enumerate(web_results):
+            try:
+                source_name = f"web_ddg_{i}"
+                await _upsert_source(
+                    db,
+                    flower_id,
+                    source_name,
+                    raw_content=result.content,
+                    parsed={"url": result.url, "title": result.title, "score": result.score},
+                )
+                stored_count += 1
+            except Exception:
+                pass
+        if stored_count > 0:
+            scraped.append("web_ddg")
 
     # Update flower status
     flower = await db.get(Flower, flower_id)

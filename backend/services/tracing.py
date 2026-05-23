@@ -14,9 +14,9 @@ Session 4 will replace this with a proper LLMResponse return type.
 from __future__ import annotations
 
 import time
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Generator
 
 import structlog
 

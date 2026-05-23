@@ -97,7 +97,9 @@ async def translate_flower(flower_id: int, session: AsyncSession) -> None:
     # Write results to DB sequentially (shared session must not be accessed concurrently)
     for lang, fields in results:
         if fields is not None:
-            await _upsert_translation(session, flower_id, lang, fields, source_method="llm_translation")
+            await _upsert_translation(
+                session, flower_id, lang, fields, source_method="llm_translation"
+            )
 
 
 async def _get_fields(flower: Flower, lang: str) -> dict[str, str | None]:
@@ -122,7 +124,9 @@ async def _get_fields(flower: Flower, lang: str) -> dict[str, str | None]:
 
     # ── Attempt 2: fill gaps with field-by-field calls for missing fields ──
     batch_count = len([v for v in translated.values() if v])
-    missing_source = {k: v for k, v in source.items() if k not in translated or not translated.get(k)}
+    missing_source = {
+        k: v for k, v in source.items() if k not in translated or not translated.get(k)
+    }
     # Also check if common name is missing
     if "name" not in translated:
         missing_source["_need_name"] = ""
