@@ -132,8 +132,9 @@ async def test_confidence_scores_only_contain_verified_fields():
 
     fields_to_verify = {f: v for f, v in generated_fields.items() if v != NOT_AVAILABLE}
     source = "Source text about rosa canina."
+    # verify_all_fields now batches all fields in one call; mock returns numbered scores
     results = await verify_all_fields(
-        fields_to_verify, source, _MockLLM("0.85"),
+        fields_to_verify, source, _MockLLM("1. 0.85\n2. 0.85"),
     )
 
     confidence_scores = {field: {"llm_score": res.confidence} for field, res in results.items()}

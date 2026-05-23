@@ -49,7 +49,13 @@ class GroqProvider:
                     continue
 
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
+                data = response.json()
+                usage = data.get("usage", {})
+                from services.llm import _token_counter
+                _token_counter.record(
+                    usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                )
+                content = data["choices"][0]["message"]["content"]
 
                 if not isinstance(content, str) or not content.strip():
                     raise RuntimeError("Groq API returned empty completion content")

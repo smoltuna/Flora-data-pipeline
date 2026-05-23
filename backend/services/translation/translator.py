@@ -13,6 +13,7 @@ Strategy:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 
@@ -60,39 +61,47 @@ _REVERSE_KEY = {v: k for k, v in _FIELD_PROMPT_KEY.items()}
 MAX_FIELD_CHARS = 600
 
 # Minimum number of successfully translated fields to accept a batch response.
-# Set high (5+) so that a near-empty batch response triggers the field-by-field fallback.
-# llama3.2:3b often produces partial or malformed JSON in batch mode; field-by-field
-# is slower but far more reliable for small models.
-MIN_BATCH_FIELDS = 5
+# If the batch produces fewer than this, missing fields are filled in with
+# individual fieldwise calls (hybrid approach).
+MIN_BATCH_FIELDS = 3
 
 # Set to True to always use field-by-field mode (skip the batch attempt entirely).
-# Recommended for llama3.2:3b and other small models.
+# llama3.2:3b can't reliably produce batch JSON under concurrent load —
+# the failed attempt wastes time before falling back. Keep fieldwise until
+# Session 4 adds per-step provider config (Groq handles batch JSON well).
 FORCE_FIELDWISE = True
 
 
 async def translate_flower(flower_id: int, session: AsyncSession) -> None:
     """Translate all text fields + common name for a flower into all supported languages.
 
-    Languages are processed sequentially so we never burst against rate limits.
+    All 6 languages are translated concurrently via asyncio.gather. Within each language,
+    fields are processed sequentially for prompt coherence. DB writes are performed
+    sequentially after all LLM calls complete to avoid concurrent session access.
     """
     flower = await session.get(Flower, flower_id)
     if not flower:
         return
 
-    for lang in sorted(ALL_LANGUAGES):
+    async def _safe_translate(lang: str) -> tuple[str, dict[str, str | None] | None]:
+        log.info("translation.start", flower_id=flower_id, lang=lang)
         try:
-            await _translate_all(flower, lang, session)
+            fields = await _get_fields(flower, lang)
+            return lang, fields
         except Exception as e:
             log.error("translation.error", flower_id=flower_id, lang=lang, error=str(e))
+            return lang, None
+
+    results = await asyncio.gather(*[_safe_translate(lang) for lang in sorted(ALL_LANGUAGES)])
+
+    # Write results to DB sequentially (shared session must not be accessed concurrently)
+    for lang, fields in results:
+        if fields is not None:
+            await _upsert_translation(session, flower_id, lang, fields, source_method="llm_translation")
 
 
-async def _translate_all(flower: Flower, lang: str, session: AsyncSession) -> None:
-    """Translate name + all text fields for one language.
-
-    Tries a single batched JSON call first; falls back to per-field calls if the
-    batch response can't be parsed or is too sparse.
-    """
-    log.info("translation.start", flower_id=flower.id, lang=lang)
+async def _get_fields(flower: Flower, lang: str) -> dict[str, str | None]:
+    """Run LLM translation for one language. Returns field dict without touching the DB."""
     llm = _get_translation_provider()
     lang_name = LANG_NAMES[lang]
 
@@ -107,15 +116,29 @@ async def _translate_all(flower: Flower, lang: str, session: AsyncSession) -> No
 
     # ── Attempt 1: batched JSON call (skipped when FORCE_FIELDWISE is set) ────
     if FORCE_FIELDWISE or not source:
-        translated = {}
+        translated: dict[str, str] = {}
     else:
         translated = await _batch_translate(llm, flower.latin_name, common, lang_name, source)
 
-    # ── Attempt 2: field-by-field fallback if batch produced too few results ──
-    if len([v for v in translated.values() if v]) < MIN_BATCH_FIELDS and source:
-        if not FORCE_FIELDWISE:
-            log.info("translation.fallback", flower_id=flower.id, lang=lang)
-        translated = await _fieldwise_translate(llm, flower.latin_name, common, lang_name, source)
+    # ── Attempt 2: fill gaps with field-by-field calls for missing fields ──
+    batch_count = len([v for v in translated.values() if v])
+    missing_source = {k: v for k, v in source.items() if k not in translated or not translated.get(k)}
+    # Also check if common name is missing
+    if "name" not in translated:
+        missing_source["_need_name"] = ""
+
+    if missing_source and (FORCE_FIELDWISE or batch_count < MIN_BATCH_FIELDS):
+        if not FORCE_FIELDWISE and batch_count > 0:
+            log.info("translation.filling_gaps", flower_id=flower.id, lang=lang,
+                     batch_got=batch_count, filling=len(missing_source))
+        gap_fields = await _fieldwise_translate(
+            llm, flower.latin_name, common, lang_name,
+            {k: v for k, v in missing_source.items() if k != "_need_name"},
+        )
+        # Merge: batch results take priority, gaps fill in the rest
+        for k, v in gap_fields.items():
+            if k not in translated or not translated.get(k):
+                translated[k] = v
 
     # Map camelCase prompt keys back to snake_case model fields
     fields: dict[str, str | None] = {"name": translated.get("name") or None}
@@ -123,9 +146,9 @@ async def _translate_all(flower: Flower, lang: str, session: AsyncSession) -> No
         val = translated.get(prompt_key)
         fields[field_name] = val.strip() if val else None
 
-    await _upsert_translation(session, flower.id, lang, fields, source_method="llm_translation")
     n = len([v for v in fields.values() if v])
     log.info("translation.done", flower_id=flower.id, lang=lang, n_fields=n)
+    return fields
 
 
 async def _batch_translate(

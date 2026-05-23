@@ -20,7 +20,12 @@ class OllamaProvider:
                 json={"model": self.llm_model, "messages": messages, "stream": False},
             )
             response.raise_for_status()
-            return response.json()["message"]["content"]
+            data = response.json()
+            from services.llm import _token_counter
+            _token_counter.record(
+                data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
+            )
+            return data["message"]["content"]
 
     async def embed(self, text: str) -> list[float]:
         async with httpx.AsyncClient(timeout=60.0) as client:

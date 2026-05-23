@@ -1,6 +1,8 @@
 """Scraping trigger endpoints — kick off per-source scraping for a flower."""
 from __future__ import annotations
 
+import asyncio
+
 from database import get_db
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from models import Flower, RawSource
@@ -66,10 +68,24 @@ async def _do_scrape(flower_id: int, latin_name: str, db: AsyncSession) -> Scrap
     scraped: list[str] = []
     failed: list[str] = []
 
+    # Run all 4 scrapers concurrently. PFAF has a 2-sec courtesy delay internally,
+    # but it now overlaps with the other 3 sources, cutting total scrape time to ~2-3s.
+    pfaf_res, wiki_res, wd_res, gbif_res = await asyncio.gather(
+        scrape_pfaf(latin_name),
+        fetch_wikipedia(latin_name),
+        fetch_wikidata(latin_name),
+        fetch_gbif(latin_name),
+        return_exceptions=True,
+    )
+
+    # Process results sequentially — DB writes on a shared session must not be concurrent.
+
     # PFAF
-    try:
-        pfaf_data = await scrape_pfaf(latin_name)
-        if pfaf_data:
+    if isinstance(pfaf_res, BaseException) or pfaf_res is None:
+        failed.append("pfaf")
+    else:
+        try:
+            pfaf_data = pfaf_res
             await _upsert_source(db, flower_id, "pfaf",
                 raw_content=pfaf_data.raw_text,
                 parsed={
@@ -81,7 +97,6 @@ async def _do_scrape(flower_id: int, latin_name: str, db: AsyncSession) -> Scrap
                     "habitat": pfaf_data.habitat,
                     "care_info": pfaf_data.care_info,
                 })
-            # Update flower record with PFAF structured fields
             flower = await db.get(Flower, flower_id)
             if flower:
                 if pfaf_data.common_name and not flower.common_name:
@@ -93,15 +108,15 @@ async def _do_scrape(flower_id: int, latin_name: str, db: AsyncSession) -> Scrap
                 flower.care_info = pfaf_data.care_info or flower.care_info
                 await db.commit()
             scraped.append("pfaf")
-        else:
+        except Exception:
             failed.append("pfaf")
-    except Exception:
-        failed.append("pfaf")
 
     # Wikipedia
-    try:
-        wiki_data = await fetch_wikipedia(latin_name)
-        if wiki_data:
+    if isinstance(wiki_res, BaseException) or wiki_res is None:
+        failed.append("wikipedia")
+    else:
+        try:
+            wiki_data = wiki_res
             await _upsert_source(db, flower_id, "wikipedia",
                 raw_content=wiki_data.extract,
                 parsed={
@@ -114,15 +129,15 @@ async def _do_scrape(flower_id: int, latin_name: str, db: AsyncSession) -> Scrap
                 flower.wikipedia_url = wiki_data.url
                 await db.commit()
             scraped.append("wikipedia")
-        else:
+        except Exception:
             failed.append("wikipedia")
-    except Exception:
-        failed.append("wikipedia")
 
     # Wikidata
-    try:
-        wd_data = await fetch_wikidata(latin_name)
-        if wd_data:
+    if isinstance(wd_res, BaseException) or wd_res is None:
+        failed.append("wikidata")
+    else:
+        try:
+            wd_data = wd_res
             await _upsert_source(db, flower_id, "wikidata",
                 raw_content=None,
                 parsed={
@@ -134,15 +149,15 @@ async def _do_scrape(flower_id: int, latin_name: str, db: AsyncSession) -> Scrap
                     "native_range_description": wd_data.native_range_description,
                 })
             scraped.append("wikidata")
-        else:
+        except Exception:
             failed.append("wikidata")
-    except Exception:
-        failed.append("wikidata")
 
     # GBIF
-    try:
-        gbif_data = await fetch_gbif(latin_name)
-        if gbif_data:
+    if isinstance(gbif_res, BaseException) or gbif_res is None:
+        failed.append("gbif")
+    else:
+        try:
+            gbif_data = gbif_res
             await _upsert_source(db, flower_id, "gbif",
                 raw_content=None,
                 parsed={
@@ -156,10 +171,8 @@ async def _do_scrape(flower_id: int, latin_name: str, db: AsyncSession) -> Scrap
                     "vernacular_names": gbif_data.vernacular_names,
                 })
             scraped.append("gbif")
-        else:
+        except Exception:
             failed.append("gbif")
-    except Exception:
-        failed.append("gbif")
 
     # Update flower status
     flower = await db.get(Flower, flower_id)

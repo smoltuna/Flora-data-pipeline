@@ -53,11 +53,68 @@ async def verify_all_fields(
     source_text: str,
     llm: LLMProvider,
 ) -> dict[str, VerificationResult]:
-    """Verify all generated text fields against combined source text."""
+    """Verify all generated text fields against source text in a single LLM call."""
+    # Filter out empty / unavailable fields
+    to_verify = {
+        f: v for f, v in generated_fields.items()
+        if v and v != "Information not available."
+    }
+    if not to_verify:
+        return {f: VerificationResult() for f in generated_fields}
+
+    # Build a numbered claims block
+    field_list = list(to_verify.keys())
+    claims = "\n".join(
+        f"{i+1}. {name} = \"{value[:300]}\""
+        for i, (name, value) in enumerate(to_verify.items())
+    )
+
+    response = await llm.complete(
+        prompt=f"""Rate how well each claim below is supported by the source material.
+
+Claims:
+{claims}
+
+Source material:
+{source_text[:5000]}
+
+For each claim, reply with its number and a score from 0.0 to 1.0:
+- 1.0 = explicitly stated in the source
+- 0.5 = partially supported or implied
+- 0.0 = not found in the source
+
+Reply with ONLY numbered scores, one per line, like:
+1. 0.8
+2. 0.5""",
+        system="You are a fact-checking assistant. Reply with only numbered scores.",
+    )
+
+    # Parse numbered scores from response (e.g. "1. 0.8\n2. 0.5")
+    score_map: dict[int, float] = {}
+    for match in re.finditer(r"(\d+)\D*(0?\.\d+|1\.0|[01])\b", response):
+        idx = int(match.group(1))
+        if 1 <= idx <= len(field_list):
+            score = max(0.0, min(1.0, float(match.group(2))))
+            score_map[idx] = score
+
+    # Fallback: if no numbered scores found, parse bare floats in order
+    if not score_map:
+        bare_scores = re.findall(r"(0?\.\d+|1\.0|[01])\b", response.strip())
+        for i, s in enumerate(bare_scores[:len(field_list)]):
+            score_map[i + 1] = max(0.0, min(1.0, float(s)))
+
     results: dict[str, VerificationResult] = {}
-    for field_name, field_value in generated_fields.items():
-        result = await verify_field(field_name, field_value, source_text, llm)
-        results[field_name] = result
+    for i, field_name in enumerate(field_list):
+        score = score_map.get(i + 1, 0.0)
+        results[field_name] = VerificationResult(
+            supported=score >= 0.5, confidence=score,
+        )
+
+    # Add empty results for fields that were skipped
+    for f in generated_fields:
+        if f not in results:
+            results[f] = VerificationResult()
+
     return results
 
 

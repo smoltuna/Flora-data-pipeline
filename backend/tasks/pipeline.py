@@ -10,10 +10,13 @@ Pipeline stages (in order):
   7. LLM synthesis
   8. Self-RAG verification
   9. Persist enriched flower + confidence scores
+ 10. Translate into all supported languages
 """
 from __future__ import annotations
 
+import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from datetime import date
 
@@ -29,6 +32,7 @@ from services.rag.grader import grade_retrieval
 from services.rag.retriever import RetrievedChunk, retrieve_for_flower
 from services.rag.synthesizer import NOT_AVAILABLE, SynthesizedFlower, synthesize
 from services.rag.verifier import verify_all_fields
+from services.tracing import PipelineTracer
 from services.translation.translator import translate_flower
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -70,16 +74,25 @@ def _log_mlflow_metrics(
 
 
 async def run_pipeline(
-    flower_id: int, db: AsyncSession,
+    flower_id: int,
+    db: AsyncSession,
     feature_date: date | None = None,
+    _batch_traces: list[dict] | None = None,
+    _images_fn: Callable[[], Awaitable[None]] | None = None,
 ) -> Flower:
     """Run the full enrichment pipeline for a single flower. Returns the updated Flower."""
     flower = await db.get(Flower, flower_id)
     if not flower:
         raise ValueError(f"Flower {flower_id} not found")
 
+    tracer = PipelineTracer(flower_id, flower.latin_name)
     log.info("pipeline.start", flower_id=flower_id, latin_name=flower.latin_name)
     start_time = time.perf_counter()
+
+    # Initialise variables used in finally so they're always defined.
+    chunks: list[RetrievedChunk] = []
+    deduped: list[RetrievedChunk] = []
+    confidence_scores: dict = {}
 
     with _mlflow_context(flower.latin_name, flower_id):
         try:
@@ -91,140 +104,191 @@ async def run_pipeline(
         except Exception:
             pass
 
-        # Stage 1: Scrape
-        flower.status = "scraping"
-        await db.commit()
-        scrape_result = await _do_scrape(flower_id, flower.latin_name, db)
-        log.info(
-            "pipeline.scraped",
-            sources=scrape_result.sources_scraped,
-            failed=scrape_result.sources_failed,
-        )
-
-        # Stage 2: Embed
-        flower.status = "embedding"
-        await db.commit()
-        llm: LLMProvider = get_provider()
-        await db.refresh(flower)
-
-        sources_result = await db.execute(select(RawSource).where(RawSource.flower_id == flower_id))
-        raw_sources = sources_result.scalars().all()
-        pfaf_raw_care: dict | None = None
-        for src in raw_sources:
-            if src.source != "pfaf" or not src.parsed_content:
-                continue
-            care_info = src.parsed_content.get("care_info")
-            if isinstance(care_info, dict) and care_info:
-                # Keep original PFAF labels/values as the canonical flower care info.
-                pfaf_raw_care = care_info
-                break
-
-        embed_success = 0
-        embed_failed = 0
-        for src in raw_sources:
-            if src.raw_content or src.parsed_content:
-                try:
-                    await embed_and_store(flower_id, src, llm, db)
-                    embed_success += 1
-                except Exception as e:
-                    embed_failed += 1
-                    log.warning("pipeline.embed_failed", source=src.source, error=str(e))
-
-        if raw_sources and embed_success == 0:
-            flower.status = "failed"
-            await db.commit()
-            raise RuntimeError(
-                "No embeddings were created. Ensure Ollama is running and "
-                "OLLAMA_EMBED_MODEL is available."
-            )
-
-        if embed_failed:
-            log.info("pipeline.embed_summary", succeeded=embed_success, failed=embed_failed)
-
-        # Stage 3: Retrieve
-        chunks = await retrieve_for_flower(flower_id, db)
-        log.info("pipeline.retrieved", n_chunks=len(chunks))
-
-        if not chunks:
-            flower.status = "failed"
-            await db.commit()
-            raise RuntimeError(
-                "No retrieved chunks found after embedding. Pipeline stopped to avoid "
-                "saving low-confidence empty enrichment output."
-            )
-
-        # Stage 4: Semantic deduplication
-        deduped = deduplicate_chunks(chunks)
-        log.info("pipeline.deduped", before=len(chunks), after=len(deduped))
-
-        # Stage 5: Adaptive RAG routing
-        sources_present = {c.source for c in deduped}
-        synthesis_result = await _adaptive_synthesize(flower, deduped, sources_present, llm)
-
-        # Stage 6–8: CRAG grading + synthesis + Self-RAG verification
-        # Wikipedia/Wikidata first: less boilerplate, more concise botanical content
-        _source_order = {"wikipedia": 0, "wikidata": 1, "gbif": 2, "pfaf": 3}
-        verification_chunks = sorted(deduped, key=lambda c: _source_order.get(c.source, 4))
-        source_text = "\n\n".join(c.chunk_text for c in verification_chunks)
-        generated_fields = {
-            f: getattr(synthesis_result, f, NOT_AVAILABLE)
-            for f in TEXT_FIELDS
-            if getattr(synthesis_result, f, NOT_AVAILABLE) != NOT_AVAILABLE
-        }
-
-        for field_name in list(generated_fields.keys()):
-            grade, _ = await grade_retrieval(field_name, flower.latin_name, deduped, llm)
-            if grade == "insufficient":
-                generated_fields[field_name] = NOT_AVAILABLE
-            elif grade == "partial":
-                log.info("pipeline.crag_partial", field=field_name)
-
-        fields_to_verify = {f: v for f, v in generated_fields.items() if v != NOT_AVAILABLE}
-        verification_results = await verify_all_fields(fields_to_verify, source_text, llm)
-
-        confidence_scores = {
-            field: {"llm_score": res.confidence}
-            for field, res in verification_results.items()
-        }
-
-        # Stage 10: Persist
-        flower.status = "enriched"
-        flower.description = synthesis_result.description
-        flower.fun_fact = synthesis_result.fun_fact
-        flower.wiki_description = synthesis_result.wiki_description
-        flower.habitat = synthesis_result.habitat
-        flower.etymology = synthesis_result.etymology
-        flower.cultural_info = synthesis_result.cultural_info
-        flower.petal_color_hex = synthesis_result.petal_color_hex
-        if pfaf_raw_care:
-            flower.care_info = pfaf_raw_care  # type: ignore[assignment]
-        elif synthesis_result.care_info:
-            flower.care_info = synthesis_result.care_info  # type: ignore[assignment]
-        flower.confidence_scores = confidence_scores
-
-        if not flower.feature_month:
-            d = feature_date or date(2026, 5, 1)
-            flower.feature_year = d.year
-            flower.feature_month = d.month
-            flower.feature_day = d.day
-
-        await db.commit()
-        await db.refresh(flower)
-
-        # Stage 10: Translate into all supported languages
-        log.info("pipeline.translating", flower_id=flower_id)
         try:
-            await translate_flower(flower_id, db)
-            log.info("pipeline.translated", flower_id=flower_id)
-        except Exception as e:
-            log.warning("pipeline.translate_failed", flower_id=flower_id, error=str(e))
+            # ── Stage 1: Scrape ─────────────────────────────────────────────
+            flower.status = "scraping"
+            await db.commit()
+            with tracer.step("scrape") as m:
+                scrape_result = await _do_scrape(flower_id, flower.latin_name, db)
+                m.api_calls = (
+                    len(scrape_result.sources_scraped) + len(scrape_result.sources_failed)
+                )
+            log.info(
+                "pipeline.scraped",
+                sources=scrape_result.sources_scraped,
+                failed=scrape_result.sources_failed,
+            )
 
-        elapsed = time.perf_counter() - start_time
-        _log_mlflow_metrics(confidence_scores, len(chunks), len(deduped), elapsed)
-        log.info(
-            "pipeline.complete", flower_id=flower_id,
-            status=flower.status, elapsed_s=round(elapsed, 2),
-        )
+            # ── Stage 2: Embed ──────────────────────────────────────────────
+            flower.status = "embedding"
+            await db.commit()
+            llm: LLMProvider = get_provider()
+            await db.refresh(flower)
+
+            pfaf_raw_care: dict | None = None
+            embed_success = 0
+            embed_failed = 0
+            with tracer.step("embed") as m:
+                sources_result = await db.execute(
+                    select(RawSource).where(RawSource.flower_id == flower_id)
+                )
+                raw_sources = sources_result.scalars().all()
+                for src in raw_sources:
+                    if src.source == "pfaf" and src.parsed_content:
+                        care_info = src.parsed_content.get("care_info")
+                        if isinstance(care_info, dict) and care_info:
+                            # Keep original PFAF labels/values as the canonical care info.
+                            pfaf_raw_care = care_info
+                            break
+
+                for src in raw_sources:
+                    if src.raw_content or src.parsed_content:
+                        try:
+                            await embed_and_store(flower_id, src, llm, db)
+                            embed_success += 1
+                        except Exception as e:
+                            embed_failed += 1
+                            log.warning("pipeline.embed_failed", source=src.source, error=str(e))
+                m.api_calls = embed_success + embed_failed
+                m.chunks_out = embed_success
+
+            if raw_sources and embed_success == 0:
+                flower.status = "failed"
+                await db.commit()
+                raise RuntimeError(
+                    "No embeddings were created. Ensure Ollama is running and "
+                    "OLLAMA_EMBED_MODEL is available."
+                )
+
+            if embed_failed:
+                log.info("pipeline.embed_summary", succeeded=embed_success, failed=embed_failed)
+
+            # ── Stage 3: Retrieve ───────────────────────────────────────────
+            with tracer.step("retrieve") as m:
+                chunks = await retrieve_for_flower(flower_id, db)
+                m.chunks_out = len(chunks)
+            log.info("pipeline.retrieved", n_chunks=len(chunks))
+
+            if not chunks:
+                flower.status = "failed"
+                await db.commit()
+                raise RuntimeError(
+                    "No retrieved chunks found after embedding. Pipeline stopped to avoid "
+                    "saving low-confidence empty enrichment output."
+                )
+
+            # ── Stage 4: Semantic deduplication ────────────────────────────
+            with tracer.step("dedup") as m:
+                deduped = deduplicate_chunks(chunks)
+                m.chunks_in = len(chunks)
+                m.chunks_out = len(deduped)
+            log.info("pipeline.deduped", before=len(chunks), after=len(deduped))
+
+            # ── Stage 5: Synthesize ─────────────────────────────────────────
+            sources_present = {c.source for c in deduped}
+            with tracer.step("synthesize") as m:
+                synthesis_result = await _adaptive_synthesize(
+                    flower, deduped, sources_present, llm
+                )
+                m.chunks_in = len(deduped)
+
+            # ── Stage 6: CRAG grading ───────────────────────────────────────
+            _source_order = {"wikipedia": 0, "wikidata": 1, "gbif": 2, "pfaf": 3}
+            verification_chunks = sorted(
+                deduped, key=lambda c: _source_order.get(c.source, 4)
+            )
+            source_text = "\n\n".join(c.chunk_text for c in verification_chunks)
+            generated_fields = {
+                f: getattr(synthesis_result, f, NOT_AVAILABLE)
+                for f in TEXT_FIELDS
+                if getattr(synthesis_result, f, NOT_AVAILABLE) != NOT_AVAILABLE
+            }
+
+            with tracer.step("grade") as m:
+                m.chunks_in = len(deduped)
+                for field_name in list(generated_fields.keys()):
+                    grade, _ = await grade_retrieval(
+                        field_name, flower.latin_name, deduped, llm
+                    )
+                    if grade == "insufficient":
+                        generated_fields[field_name] = NOT_AVAILABLE
+                    elif grade == "partial":
+                        log.info("pipeline.crag_partial", field=field_name)
+
+            # ── Stage 7: Self-RAG verification ─────────────────────────────
+            fields_to_verify = {
+                f: v for f, v in generated_fields.items() if v != NOT_AVAILABLE
+            }
+            with tracer.step("verify") as m:
+                verification_results = await verify_all_fields(
+                    fields_to_verify, source_text, llm
+                )
+
+            confidence_scores = {
+                field: {"llm_score": res.confidence}
+                for field, res in verification_results.items()
+            }
+
+            # ── Persist ─────────────────────────────────────────────────────
+            flower.status = "enriched"
+            flower.description = synthesis_result.description
+            flower.fun_fact = synthesis_result.fun_fact
+            flower.wiki_description = synthesis_result.wiki_description
+            flower.habitat = synthesis_result.habitat
+            flower.etymology = synthesis_result.etymology
+            flower.cultural_info = synthesis_result.cultural_info
+            flower.petal_color_hex = synthesis_result.petal_color_hex
+            if pfaf_raw_care:
+                flower.care_info = pfaf_raw_care  # type: ignore[assignment]
+            elif synthesis_result.care_info:
+                flower.care_info = synthesis_result.care_info  # type: ignore[assignment]
+            flower.confidence_scores = confidence_scores
+
+            if not flower.feature_month:
+                d = feature_date or date(2026, 5, 1)
+                flower.feature_year = d.year
+                flower.feature_month = d.month
+                flower.feature_day = d.day
+
+            await db.commit()
+            await db.refresh(flower)
+
+            # ── Stage 8: Translate + Images (concurrent) ────────────────────
+            log.info("pipeline.translating", flower_id=flower_id)
+
+            async def _translate_traced() -> None:
+                with tracer.step("translate") as m:
+                    try:
+                        await translate_flower(flower_id, db)
+                        log.info("pipeline.translated", flower_id=flower_id)
+                    except Exception as e:
+                        log.warning("pipeline.translate_failed", flower_id=flower_id, error=str(e))
+                        m.errors.append(str(e))
+
+            if _images_fn is not None:
+                async def _images_traced() -> None:
+                    with tracer.step("images") as m:
+                        await _images_fn()
+                        m.api_calls = 3  # wikimedia + fal main + fal lock
+
+                await asyncio.gather(_translate_traced(), _images_traced())
+            else:
+                await _translate_traced()
+
+        finally:
+            elapsed = time.perf_counter() - start_time
+            if chunks:
+                _log_mlflow_metrics(confidence_scores, len(chunks), len(deduped), elapsed)
+            tracer.log_summary()
+            if _batch_traces is not None:
+                _batch_traces.append(tracer.summary())
+            log.info(
+                "pipeline.complete",
+                flower_id=flower_id,
+                status=flower.status,
+                elapsed_s=round(elapsed, 2),
+            )
+
         return flower
 
 

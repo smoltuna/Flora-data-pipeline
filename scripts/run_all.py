@@ -26,6 +26,8 @@ START_DATE = date(2026, 5, 1)
 
 import asyncio
 import argparse
+import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -127,6 +129,82 @@ def _eta(elapsed: float, done: int, total: int) -> float | None:
     return round((elapsed / done) * remaining, 1) if remaining > 0 else 0.0
 
 
+def _write_trace(batch_traces: list[dict], total_elapsed: float) -> None:
+    """Write batch trace summary to output/trace_{timestamp}.json."""
+    output_dir = Path(__file__).parent.parent / "output"
+    output_dir.mkdir(exist_ok=True)
+    timestamp = int(time.time())
+    trace_path = output_dir / f"trace_{timestamp}.json"
+    payload = {
+        "timestamp": timestamp,
+        "total_elapsed_s": round(total_elapsed, 3),
+        "n_flowers": len(batch_traces),
+        "batch_totals": {
+            "tokens": sum(t.get("total_tokens", 0) for t in batch_traces),
+            "llm_calls": sum(t.get("total_llm_calls", 0) for t in batch_traces),
+            "api_calls": sum(t.get("total_api_calls", 0) for t in batch_traces),
+        },
+        "flowers": batch_traces,
+    }
+    trace_path.write_text(json.dumps(payload, indent=2))
+    log.info("run_all.trace_written", path=str(trace_path))
+    return trace_path
+
+
+def _print_summary(batch_traces: list[dict], total_elapsed: float) -> None:
+    """Print a human-readable summary table to stdout."""
+    if not batch_traces:
+        return
+
+    steps_order = ["scrape", "embed", "grade", "synth", "verify", "transl"]
+    step_aliases = {
+        "scrape": "scrape", "embed": "embed", "retrieve": None, "dedup": None,
+        "synthesize": "synth", "grade": "grade", "verify": "verify",
+        "translate": "transl", "images": "images",
+    }
+
+    # Collect per-flower step data
+    rows: list[dict] = []
+    for trace in batch_traces:
+        row: dict[str, str] = {"name": trace["latin_name"][:22]}
+        step_data = {s["name"]: s for s in trace.get("steps", [])}
+        for step_name, alias in step_aliases.items():
+            if alias and step_name in step_data:
+                s = step_data[step_name]
+                dur = s["duration_s"]
+                row[alias] = f"{dur:.0f}s" if dur >= 1 else "<1s"
+        row["total"] = f"{trace['total_duration_s']:.0f}s"
+        row["calls"] = str(trace["total_llm_calls"])
+        rows.append(row)
+
+    # Column widths
+    cols = ["name"] + steps_order + ["total", "calls"]
+    headers = {"name": "Flower", "scrape": "Scrape", "embed": "Embed",
+               "grade": "Grade", "synth": "Synth", "verify": "Verify",
+               "transl": "Transl", "total": "Total", "calls": "LLM"}
+    widths = {c: max(len(headers.get(c, c)), *(len(r.get(c, "")) for r in rows)) for c in cols}
+
+    def fmt_row(vals: dict[str, str]) -> str:
+        return " │ ".join(vals.get(c, "").rjust(widths[c]) if c != "name"
+                          else vals.get(c, "").ljust(widths[c]) for c in cols)
+
+    sep = "─┼─".join("─" * widths[c] for c in cols)
+    hdr = fmt_row(headers)
+
+    total_calls = sum(t.get("total_llm_calls", 0) for t in batch_traces)
+    total_tokens = sum(t.get("total_tokens", 0) for t in batch_traces)
+
+    print(f"\n{'─' * len(sep)}")
+    print(f"Flora Pipeline — {len(batch_traces)} flower(s), {total_elapsed:.0f}s wall time, "
+          f"{total_calls} LLM calls, {total_tokens:,} tokens")
+    print(f"{'─' * len(sep)}")
+    print(hdr)
+    print(sep)
+    for r in rows:
+        print(fmt_row(r))
+    print(f"{'─' * len(sep)}\n")
+
+
 async def main(
     latin_names: list[str] | None,
     skip_images: bool,
@@ -147,72 +225,116 @@ async def main(
         return
 
     log.info("run_all.start", n_flowers=total, skip_images=skip_images, skip_data=skip_data)
-    data_ok = data_fail = img_ok = img_fail = 0
     batch_start = time.perf_counter()
+    batch_traces: list[dict] = []
 
-    for index, flower in enumerate(flowers, start=1):
-        elapsed = time.perf_counter() - batch_start
-        feature_date = START_DATE + timedelta(days=index - 1)
-        log.info(
-            "run_all.processing",
-            latin_name=flower.latin_name,
-            progress=f"{index}/{total}",
-            feature_date=str(feature_date),
-            eta_s=_eta(elapsed, data_ok + data_fail + img_ok + img_fail, total),
-        )
+    # Shared counters — safe without locks since asyncio is single-threaded.
+    counts: dict[str, int] = {"data_ok": 0, "data_fail": 0, "img_ok": 0, "img_fail": 0}
 
-        # ── Stage 1: Data pipeline ──────────────────────────────────────────
-        if not skip_data:
+    sem = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_FLOWERS", "3")))
+
+    def _make_images_fn(flower_id: int, latin_name: str):
+        """Return an async callable that fetches + processes images for one flower."""
+        async def _fn() -> None:
             step_start = time.perf_counter()
-            async with async_session_factory() as session:
+            async with async_session_factory() as img_sess:
                 try:
-                    await run_pipeline(flower.id, session, feature_date=feature_date)
-                    data_ok += 1
+                    f = await img_sess.get(Flower, flower_id)
+                    if f.status not in ENRICHED_STATUSES:
+                        log.warning(
+                            "run_all.images_skip",
+                            latin_name=latin_name,
+                            reason=f"status={f.status!r} — must be enriched first",
+                        )
+                        return
+                    await _run_images(f, img_sess)
+                    counts["img_ok"] += 1
                     log.info(
-                        "run_all.data_done",
-                        latin_name=flower.latin_name,
+                        "run_all.images_done",
+                        latin_name=latin_name,
                         elapsed_s=round(time.perf_counter() - step_start, 1),
                     )
                 except Exception as exc:
-                    data_fail += 1
+                    counts["img_fail"] += 1
                     log.error(
-                        "run_all.data_error",
-                        latin_name=flower.latin_name,
+                        "run_all.images_error",
+                        latin_name=latin_name,
                         error=str(exc),
                         exc_type=type(exc).__name__,
                     )
-                    continue  # skip images if data failed
+        return _fn
 
-        if skip_images:
-            continue
+    async def _process_one(flower: Flower, feature_date: date) -> None:
+        async with sem:
+            log.info(
+                "run_all.processing",
+                latin_name=flower.latin_name,
+                feature_date=str(feature_date),
+            )
 
-        # ── Stage 2: Image pipeline ─────────────────────────────────────────
-        step_start = time.perf_counter()
-        async with async_session_factory() as session:
-            try:
-                f = await session.get(Flower, flower.id)
-                if f.status not in ENRICHED_STATUSES:
-                    log.warning(
-                        "run_all.images_skip",
-                        latin_name=flower.latin_name,
-                        reason=f"status={f.status!r} — must be enriched first",
-                    )
-                    continue
-                await _run_images(f, session)
-                img_ok += 1
-                log.info(
-                    "run_all.images_done",
-                    latin_name=flower.latin_name,
-                    elapsed_s=round(time.perf_counter() - step_start, 1),
-                )
-            except Exception as exc:
-                img_fail += 1
-                log.error(
-                    "run_all.images_error",
-                    latin_name=flower.latin_name,
-                    error=str(exc),
-                    exc_type=type(exc).__name__,
-                )
+            if not skip_data:
+                images_fn = _make_images_fn(flower.id, flower.latin_name) if not skip_images else None
+                step_start = time.perf_counter()
+                async with async_session_factory() as session:
+                    try:
+                        await run_pipeline(
+                            flower.id, session,
+                            feature_date=feature_date,
+                            _batch_traces=batch_traces,
+                            _images_fn=images_fn,
+                        )
+                        counts["data_ok"] += 1
+                        log.info(
+                            "run_all.data_done",
+                            latin_name=flower.latin_name,
+                            elapsed_s=round(time.perf_counter() - step_start, 1),
+                        )
+                    except Exception as exc:
+                        counts["data_fail"] += 1
+                        log.error(
+                            "run_all.data_error",
+                            latin_name=flower.latin_name,
+                            error=str(exc),
+                            exc_type=type(exc).__name__,
+                        )
+                return  # images were handled (or skipped) inside pipeline
+
+            # skip_data=True → images-only mode
+            if not skip_images:
+                step_start = time.perf_counter()
+                async with async_session_factory() as session:
+                    try:
+                        f = await session.get(Flower, flower.id)
+                        if f.status not in ENRICHED_STATUSES:
+                            log.warning(
+                                "run_all.images_skip",
+                                latin_name=flower.latin_name,
+                                reason=f"status={f.status!r} — must be enriched first",
+                            )
+                            return
+                        await _run_images(f, session)
+                        counts["img_ok"] += 1
+                        log.info(
+                            "run_all.images_done",
+                            latin_name=flower.latin_name,
+                            elapsed_s=round(time.perf_counter() - step_start, 1),
+                        )
+                    except Exception as exc:
+                        counts["img_fail"] += 1
+                        log.error(
+                            "run_all.images_error",
+                            latin_name=flower.latin_name,
+                            error=str(exc),
+                            exc_type=type(exc).__name__,
+                        )
+
+    feature_dates = [START_DATE + timedelta(days=i) for i in range(total)]
+    await asyncio.gather(*[_process_one(f, fd) for f, fd in zip(flowers, feature_dates)])
+
+    data_ok = counts["data_ok"]
+    data_fail = counts["data_fail"]
+    img_ok = counts["img_ok"]
+    img_fail = counts["img_fail"]
 
     # ── Stage 3: xcassets bundle export ────────────────────────────────────────
     xcassets_dir = Path(__file__).parent.parent / "output" / "FlowerAssets.xcassets"
@@ -226,7 +348,14 @@ async def main(
         log.error("run_all.export_error", error=str(exc))
         print(f"\nBundle export failed: {exc}")
 
-    total_elapsed = round(time.perf_counter() - batch_start, 1)
+    total_elapsed = time.perf_counter() - batch_start
+
+    # ── Write batch trace ───────────────────────────────────────────────────────
+    if batch_traces:
+        trace_path = _write_trace(batch_traces, total_elapsed)
+        print(f"Trace written to:\n  {trace_path}")
+        _print_summary(batch_traces, total_elapsed)
+
     log.info(
         "run_all.complete",
         data_succeeded=data_ok,
@@ -234,7 +363,7 @@ async def main(
         images_succeeded=img_ok,
         images_failed=img_fail,
         total=total,
-        elapsed_s=total_elapsed,
+        elapsed_s=round(total_elapsed, 1),
     )
 
 
