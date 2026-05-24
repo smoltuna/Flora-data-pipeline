@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     chunk_size: int = 500
     chunk_overlap: int = 50
 
+    # LLM-as-Judge (Session 8) — fields scoring below this on factual_accuracy
+    # are logged as warnings (not blocked).
+    quality_gate_threshold: float = 0.5
+
     # MLflow
     mlflow_tracking_uri: str = "http://localhost:5001"
 

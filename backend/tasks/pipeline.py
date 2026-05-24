@@ -31,6 +31,7 @@ from services.rag.deduplicator import deduplicate_chunks
 from services.rag.embedder import embed_and_store
 from services.rag.extractor import extract_field_facts
 from services.rag.grader import grade_and_correct
+from services.rag.judge import judge_flower
 from services.rag.query_gen import generate_field_queries, generate_hyde_document
 from services.rag.retriever import RetrievedChunk, hybrid_retrieve, retrieve_for_flower
 from services.rag.router import FIELD_CONFIG, FieldDifficulty
@@ -305,6 +306,18 @@ async def run_pipeline(
                 field: {"llm_score": res.confidence}
                 for field, res in verification_results.items()
             }
+
+            # ── Stage 7b: LLM-as-Judge ─────────────────────────────────────
+            judge_llm: LLMProvider = get_provider(step="judge")
+            with tracer.step("judge") as m:
+                judge_scores = await judge_flower(
+                    flower.latin_name,
+                    fields_to_verify,
+                    {f: graded_per_field.get(f, []) for f in fields_to_verify},
+                    judge_llm,
+                )
+            for field, scores in judge_scores.items():
+                confidence_scores.setdefault(field, {})["judge"] = scores
 
             # ── Persist ─────────────────────────────────────────────────────
             flower.status = "enriched"
