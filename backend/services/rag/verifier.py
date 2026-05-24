@@ -2,6 +2,7 @@
 
 Asks the LLM to cite the supporting passage for each generated field.
 Returns a confidence score (0–1) stored as confidence_scores JSONB in the flowers table.
+Source confidence weighting adjusts scores based on how reliable the supporting sources are.
 """
 from __future__ import annotations
 
@@ -10,6 +11,32 @@ import re
 from pydantic import BaseModel
 
 from services.llm.provider import LLMProvider
+from services.rag.retriever import RetrievedChunk
+
+# Reliability weights per source (higher = more trustworthy)
+SOURCE_CONFIDENCE: dict[str, float] = {
+    "pfaf": 0.95,
+    "wikidata": 0.90,
+    "gbif": 0.90,
+    "wikipedia": 0.80,
+    "web_ddg": 0.65,
+    "web_ddg_correction": 0.65,
+}
+
+
+def _source_weight(chunks: list[RetrievedChunk]) -> float:
+    """Return the max source confidence across chunks (best source sets the weight)."""
+    if not chunks:
+        return 1.0
+    weights: list[float] = []
+    for c in chunks:
+        for src_key, w in SOURCE_CONFIDENCE.items():
+            if c.source == src_key or c.source.startswith(src_key + "_"):
+                weights.append(w)
+                break
+        else:
+            weights.append(0.70)  # unknown source gets moderate weight
+    return max(weights)
 
 
 class VerificationResult(BaseModel):
@@ -52,8 +79,14 @@ async def verify_all_fields(
     generated_fields: dict[str, str],
     source_text: str,
     llm: LLMProvider,
+    field_chunks: dict[str, list[RetrievedChunk]] | None = None,
 ) -> dict[str, VerificationResult]:
-    """Verify all generated text fields against source text in a single LLM call."""
+    """Verify all generated text fields against source text in a single LLM call.
+
+    If field_chunks is provided, LLM scores are scaled by the max source confidence
+    for each field's contributing chunks (e.g. web-only fields score lower than
+    PFAF-backed fields regardless of LLM judgment).
+    """
     # Filter out empty / unavailable fields
     to_verify = {
         f: v for f, v in generated_fields.items()
@@ -106,9 +139,17 @@ Reply with ONLY numbered scores, one per line, like:
 
     results: dict[str, VerificationResult] = {}
     for i, field_name in enumerate(field_list):
-        score = score_map.get(i + 1, 0.0)
+        raw_score = score_map.get(i + 1, 0.0)
+
+        # Apply source confidence weighting if chunk info is available
+        if field_chunks and field_name in field_chunks:
+            weight = _source_weight(field_chunks[field_name])
+            score = raw_score * weight
+        else:
+            score = raw_score
+
         results[field_name] = VerificationResult(
-            supported=score >= 0.5, confidence=score,
+            supported=score >= 0.5, confidence=round(score, 4),
         )
 
     # Add empty results for fields that were skipped
@@ -121,7 +162,6 @@ Reply with ONLY numbered scores, one per line, like:
 
 def _parse_verification(response: str) -> VerificationResult:
     text = response.strip()
-    # Extract first float-like token from the response
     match = re.search(r"\b(0?\.\d+|1\.0|[01])\b", text)
     if match:
         try:

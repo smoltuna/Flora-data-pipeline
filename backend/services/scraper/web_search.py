@@ -33,18 +33,21 @@ async def search_web(
     latin_name: str,
     common_name: str | None = None,
     max_results: int = 5,
+    query: str | None = None,
 ) -> list[WebSearchResult]:
     """Search DuckDuckGo for the flower, then scrape each result page.
 
     Returns up to max_results results with extracted clean text.
     Returns [] if web search is disabled.
+    Pass `query` to override the default "{latin_name} flower" search term.
     """
     if not settings.web_search_enabled:
         return []
 
-    query = f"{latin_name} flower"
-    if common_name:
-        query = f"{latin_name} {common_name} flower"
+    if not query:
+        query = f"{latin_name} flower"
+        if common_name:
+            query = f"{latin_name} {common_name} flower"
 
     # DuckDuckGo search is synchronous — run in thread to avoid blocking
     loop = asyncio.get_running_loop()

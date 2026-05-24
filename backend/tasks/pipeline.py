@@ -29,9 +29,10 @@ from services.embeddings.provider import EmbeddingProvider, get_embedding_provid
 from services.llm.provider import LLMProvider, get_provider
 from services.rag.deduplicator import deduplicate_chunks
 from services.rag.embedder import embed_and_store
-from services.rag.grader import grade_retrieval
+from services.rag.extractor import extract_field_facts
+from services.rag.grader import grade_and_correct
 from services.rag.query_gen import generate_field_queries, generate_hyde_document
-from services.rag.retriever import RetrievedChunk, retrieve_for_field, retrieve_for_flower
+from services.rag.retriever import RetrievedChunk, hybrid_retrieve, retrieve_for_flower
 from services.rag.router import FIELD_CONFIG, FieldDifficulty
 from services.rag.synthesizer import NOT_AVAILABLE, SynthesizedFlower, synthesize
 from services.rag.verifier import verify_all_fields
@@ -190,9 +191,8 @@ async def run_pipeline(
                                 flower.latin_name, flower.common_name, field_name, query_gen_llm
                             )
 
-                    field_chunks = await retrieve_for_field(
+                    field_chunks = await hybrid_retrieve(
                         flower_id=flower_id,
-                        field_name=field_name,
                         queries=queries,
                         hyde_doc=hyde_doc,
                         source_filter=config.sources,
@@ -208,7 +208,7 @@ async def run_pipeline(
                         n_chunks=len(field_chunks),
                     )
 
-                # Union per-field chunks into a flat list (dedup by chunk_id)
+                # Union per-field chunks into a flat list for total count
                 seen_ids: set[int] = set()
                 chunks = []
                 for field_chunks_list in per_field_chunks.values():
@@ -228,53 +228,77 @@ async def run_pipeline(
                     "saving low-confidence empty enrichment output."
                 )
 
-            # ── Stage 4: Semantic deduplication ────────────────────────────
-            with tracer.step("dedup") as m:
-                deduped = deduplicate_chunks(chunks)
+            # ── Stage 4: CRAG grade + correct ──────────────────────────────
+            graded_per_field: dict[str, list[RetrievedChunk]] = {}
+            with tracer.step("grade") as m:
                 m.chunks_in = len(chunks)
+                for field_name, field_chunks_list in per_field_chunks.items():
+                    field_cfg = FIELD_CONFIG[field_name]
+                    final_chunks, grade = await grade_and_correct(
+                        flower_id, flower.latin_name, flower.common_name, field_name,
+                        field_chunks_list, field_cfg, db, grade_llm, embed_provider,
+                    )
+                    graded_per_field[field_name] = final_chunks  # [] if insufficient
+                    if grade == "partial":
+                        log.info("pipeline.crag_partial", field=field_name)
+                    elif grade == "insufficient":
+                        log.debug("pipeline.crag_insufficient", field=field_name)
+
+            # ── Stage 4b: Semantic deduplication (over graded chunks) ───────
+            seen_graded: set[int] = set()
+            all_graded_chunks: list[RetrievedChunk] = []
+            for fc in graded_per_field.values():
+                for chunk in fc:
+                    # Skip ephemeral correction chunks (negative IDs) from dedup
+                    if chunk.chunk_id >= 0 and chunk.chunk_id not in seen_graded:
+                        seen_graded.add(chunk.chunk_id)
+                        all_graded_chunks.append(chunk)
+
+            with tracer.step("dedup") as m:
+                deduped = deduplicate_chunks(all_graded_chunks)
+                m.chunks_in = len(all_graded_chunks)
                 m.chunks_out = len(deduped)
-            log.info("pipeline.deduped", before=len(chunks), after=len(deduped))
+            log.info("pipeline.deduped", before=len(all_graded_chunks), after=len(deduped))
 
-            # ── Stage 5: Synthesize ─────────────────────────────────────────
-            sources_present = {c.source for c in deduped}
+            # ── Stage 5: Extract facts for COMPLEX fields ───────────────────
+            field_context: dict[str, list[RetrievedChunk] | str] = {}
+            with tracer.step("extract") as m:
+                m.chunks_in = len(all_graded_chunks)
+                for field_name, field_chunks_list in graded_per_field.items():
+                    if not field_chunks_list:
+                        continue  # insufficient → absent from context → NOT_AVAILABLE
+                    field_cfg = FIELD_CONFIG[field_name]
+                    if field_cfg.difficulty == FieldDifficulty.COMPLEX:
+                        facts = await extract_field_facts(
+                            field_name, flower.latin_name, field_chunks_list, llm
+                        )
+                        if facts and facts != NOT_AVAILABLE:
+                            field_context[field_name] = facts
+                    else:
+                        field_context[field_name] = field_chunks_list
+
+            # ── Stage 6: Synthesize ─────────────────────────────────────────
             with tracer.step("synthesize") as m:
-                synthesis_result = await _adaptive_synthesize(
-                    flower, deduped, sources_present, llm
+                synthesis_result = await synthesize(
+                    flower.latin_name, flower.common_name, field_context, llm
                 )
-                m.chunks_in = len(deduped)
+                m.chunks_in = len(all_graded_chunks)
 
-            # ── Stage 6: CRAG grading ───────────────────────────────────────
+            # ── Stage 7: Self-RAG verification ─────────────────────────────
             _source_order = {"wikipedia": 0, "wikidata": 1, "gbif": 2, "pfaf": 3}
             verification_chunks = sorted(
                 deduped, key=lambda c: _source_order.get(c.source, 4)
             )
             source_text = "\n\n".join(c.chunk_text for c in verification_chunks)
-            generated_fields = {
+            fields_to_verify = {
                 f: getattr(synthesis_result, f, NOT_AVAILABLE)
                 for f in TEXT_FIELDS
                 if getattr(synthesis_result, f, NOT_AVAILABLE) != NOT_AVAILABLE
             }
-
-            with tracer.step("grade") as m:
-                m.chunks_in = len(deduped)
-                for field_name in list(generated_fields.keys()):
-                    # Use field-specific chunks when available — less noise for grader
-                    grade_chunks = per_field_chunks.get(field_name) or deduped
-                    grade, _ = await grade_retrieval(
-                        field_name, flower.latin_name, grade_chunks, grade_llm
-                    )
-                    if grade == "insufficient":
-                        generated_fields[field_name] = NOT_AVAILABLE
-                    elif grade == "partial":
-                        log.info("pipeline.crag_partial", field=field_name)
-
-            # ── Stage 7: Self-RAG verification ─────────────────────────────
-            fields_to_verify = {
-                f: v for f, v in generated_fields.items() if v != NOT_AVAILABLE
-            }
             with tracer.step("verify") as m:
                 verification_results = await verify_all_fields(
-                    fields_to_verify, source_text, llm
+                    fields_to_verify, source_text, llm,
+                    field_chunks={f: graded_per_field.get(f, []) for f in fields_to_verify},
                 )
 
             confidence_scores = {
@@ -345,22 +369,3 @@ async def run_pipeline(
         return flower
 
 
-async def _adaptive_synthesize(
-    flower: Flower,
-    chunks: list[RetrievedChunk],
-    sources_present: set[str],
-    llm: LLMProvider,
-) -> SynthesizedFlower:
-    """Route synthesis based on source coverage."""
-    if "pfaf" in sources_present and "wikipedia" in sources_present:
-        return await synthesize(flower.latin_name, flower.common_name, chunks, llm)
-    elif "wikidata" in sources_present or "gbif" in sources_present:
-        return await synthesize(
-            flower.latin_name, flower.common_name, chunks, llm,
-            fields_to_skip={"fun_fact", "cultural_info"},
-        )
-    else:
-        return await synthesize(
-            flower.latin_name, flower.common_name, chunks, llm,
-            fields_to_skip={"fun_fact", "cultural_info", "etymology"},
-        )
