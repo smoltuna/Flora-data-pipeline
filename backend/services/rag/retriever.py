@@ -92,61 +92,6 @@ async def _vector_search(
     return [c for c, _ in scored[:top_k]]
 
 
-async def retrieve_for_field(
-    flower_id: int,
-    field_name: str,
-    queries: list[str],           # 1 for SIMPLE, 3 for COMPLEX
-    hyde_doc: str | None,         # hypothetical document (if HyDE)
-    source_filter: list[str],     # which sources to search; ["all"] = no filter
-    top_k: int,
-    db: AsyncSession,
-    embed_provider: EmbeddingProvider,
-) -> list[RetrievedChunk]:
-    """Vector-only retrieval for a field. Superseded by hybrid_retrieve in Session 6."""
-    result = await db.execute(
-        select(SourceEmbedding).where(SourceEmbedding.flower_id == flower_id)
-    )
-    all_rows = result.scalars().all()
-    candidates = [
-        RetrievedChunk(
-            chunk_id=row.id,
-            chunk_text=row.chunk_text,
-            source=(row.metadata_ or {}).get("source", "unknown"),
-            rrf_score=0.0,
-            embedding=list(row.embedding) if row.embedding is not None else [],
-        )
-        for row in all_rows
-    ]
-
-    all_queries = list(queries)
-    if hyde_doc:
-        all_queries.append(hyde_doc)
-
-    best_scores: dict[int, float] = {}
-    for query_text in all_queries:
-        query_vec = await embed_provider.embed(query_text)
-        for chunk in candidates:
-            if not chunk.embedding:
-                continue
-            sim = _cosine_similarity(query_vec, chunk.embedding)
-            if sim > best_scores.get(chunk.chunk_id, -1.0):
-                best_scores[chunk.chunk_id] = sim
-
-    scored = [
-        (chunk, best_scores.get(chunk.chunk_id, 0.0))
-        for chunk in candidates
-        if chunk.chunk_id in best_scores
-        if _source_matches(chunk.source, source_filter)
-    ]
-    scored.sort(key=lambda x: x[1], reverse=True)
-
-    result_chunks = []
-    for chunk, score in scored[:top_k]:
-        chunk.rrf_score = score
-        result_chunks.append(chunk)
-    return result_chunks
-
-
 def reciprocal_rank_fusion(
     result_lists: list[list[RetrievedChunk]],
     k: int = 60,

@@ -10,8 +10,8 @@ from __future__ import annotations
 import re
 
 import structlog
-
 from config import settings
+
 from services.llm.provider import LLMProvider
 from services.rag.retriever import RetrievedChunk
 
@@ -23,7 +23,7 @@ EVAL_CRITERIA: dict[str, str] = {
     "factual_accuracy": "Are the stated facts correct and verifiable from the sources?",
     "completeness":     "Does the text cover the most important aspects of this topic?",
     "coherence":        "Is the text well-written, clear, and natural-sounding?",
-    "source_fidelity":  "Does the text faithfully represent the source material without hallucination?",
+    "source_fidelity":  "Does the text faithfully represent the sources without hallucination?",
     "engagement":       "Is the text interesting and suitable for a mobile app audience?",
 }
 

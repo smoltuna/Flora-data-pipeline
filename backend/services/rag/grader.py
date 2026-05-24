@@ -83,10 +83,10 @@ async def grade_and_correct(
     common_name: str | None,
     field_name: str,
     chunks: list[RetrievedChunk],
-    field_config: "FieldConfig",
-    db: "AsyncSession",
+    field_config: FieldConfig,
+    db: AsyncSession,
     llm: LLMProvider,
-    embed: "EmbeddingProvider",
+    embed: EmbeddingProvider,
 ) -> tuple[list[RetrievedChunk], str]:
     """CRAG with one round of web search correction for COMPLEX fields.
 

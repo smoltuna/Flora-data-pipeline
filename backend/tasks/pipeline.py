@@ -1,16 +1,17 @@
-"""Sequential pipeline orchestration — runs full enrichment for one flower.
+"""Pipeline orchestration — runs full enrichment for one flower.
 
 Pipeline stages (in order):
-  1. Scrape all sources (PFAF, Wikipedia, Wikidata, GBIF)
+  1. Scrape all sources (PFAF, Wikipedia, Wikidata, GBIF, web)
   2. Embed all sources → store in source_embeddings
-  3. Retrieve all chunks for this flower
-  4. Semantic deduplication
-  5. Adaptive RAG routing (full / sparse / minimal based on source coverage)
-  6. Per-field Corrective RAG grading
-  7. LLM synthesis
-  8. Self-RAG verification
-  9. Persist enriched flower + confidence scores
- 10. Translate into all supported languages
+  3. Per-field hybrid retrieval (BM25 + vector + RRF, multi-query + HyDE for complex)
+  4. CRAG grade + targeted web search correction
+  5. Semantic deduplication of graded chunks
+  6. Fact extraction (COMPLEX fields only)
+  7. LLM synthesis with per-field context
+  8. Self-RAG verification with source confidence weighting
+  9. LLM-as-Judge evaluation (5 criteria per field)
+ 10. Persist enriched flower + confidence/judge scores
+ 11. Translate into 6 languages, concurrent with image processing
 """
 from __future__ import annotations
 
@@ -33,9 +34,9 @@ from services.rag.extractor import extract_field_facts
 from services.rag.grader import grade_and_correct
 from services.rag.judge import judge_flower
 from services.rag.query_gen import generate_field_queries, generate_hyde_document
-from services.rag.retriever import RetrievedChunk, hybrid_retrieve, retrieve_for_flower
+from services.rag.retriever import RetrievedChunk, hybrid_retrieve
 from services.rag.router import FIELD_CONFIG, FieldDifficulty
-from services.rag.synthesizer import NOT_AVAILABLE, SynthesizedFlower, synthesize
+from services.rag.synthesizer import NOT_AVAILABLE, synthesize
 from services.rag.verifier import verify_all_fields
 from services.tracing import PipelineTracer
 from services.translation.translator import translate_flower
