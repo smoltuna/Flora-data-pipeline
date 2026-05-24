@@ -3,6 +3,7 @@ import asyncio
 import httpx
 from config import settings
 
+from services.llm.provider import LLMResponse
 from services.llm.rate_limiter import gemini_limiter
 
 _GEMINI_CHAT_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -17,7 +18,7 @@ class GeminiProvider:
         if not self.api_key:
             raise ValueError("GEMINI_API_KEY is not set")
 
-    async def complete(self, prompt: str, system: str = "") -> str:
+    async def complete(self, prompt: str, system: str = "") -> LLMResponse:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -47,13 +48,11 @@ class GeminiProvider:
                 response.raise_for_status()
                 data = response.json()
                 usage = data.get("usage", {})
+                tokens = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
                 from services.llm import _token_counter
-                _token_counter.record(
-                    usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-                )
+                _token_counter.record(tokens)
                 content = data["choices"][0]["message"]["content"]
                 if isinstance(content, list):
-                    # OpenAI-compatible responses may contain segmented text content.
                     content = "".join(
                         part.get("text", "")
                         for part in content
@@ -63,7 +62,7 @@ class GeminiProvider:
                 if not isinstance(content, str) or not content.strip():
                     raise RuntimeError("Gemini API returned empty completion content")
 
-                return content
+                return LLMResponse(text=content, tokens_used=tokens)
 
             except (httpx.TimeoutException, httpx.TransportError):
                 if attempt >= _MAX_ATTEMPTS:
@@ -72,9 +71,3 @@ class GeminiProvider:
                 backoff *= 2
 
         raise RuntimeError("Gemini API: max retries exceeded")
-
-    async def embed(self, text: str) -> list[float]:
-        # Gemini embeddings are not needed in this pipeline.
-        from services.llm.ollama import OllamaProvider
-
-        return await OllamaProvider().embed(text)

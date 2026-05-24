@@ -45,7 +45,7 @@ Reply with ONLY the number, nothing else.""",
         system="You are a fact-checking assistant. Reply with only a decimal number.",
     )
 
-    return _parse_verification(response)
+    return _parse_verification(response.text)
 
 
 async def verify_all_fields(
@@ -90,8 +90,9 @@ Reply with ONLY numbered scores, one per line, like:
     )
 
     # Parse numbered scores from response (e.g. "1. 0.8\n2. 0.5")
+    response_text = response.text
     score_map: dict[int, float] = {}
-    for match in re.finditer(r"(\d+)\D*(0?\.\d+|1\.0|[01])\b", response):
+    for match in re.finditer(r"(\d+)\D*(0?\.\d+|1\.0|[01])\b", response_text):
         idx = int(match.group(1))
         if 1 <= idx <= len(field_list):
             score = max(0.0, min(1.0, float(match.group(2))))
@@ -99,7 +100,7 @@ Reply with ONLY numbered scores, one per line, like:
 
     # Fallback: if no numbered scores found, parse bare floats in order
     if not score_map:
-        bare_scores = re.findall(r"(0?\.\d+|1\.0|[01])\b", response.strip())
+        bare_scores = re.findall(r"(0?\.\d+|1\.0|[01])\b", response_text.strip())
         for i, s in enumerate(bare_scores[:len(field_list)]):
             score_map[i + 1] = max(0.0, min(1.0, float(s)))
 

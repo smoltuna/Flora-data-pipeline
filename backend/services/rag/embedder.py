@@ -1,10 +1,10 @@
 """Embedding service — chunks scraped content and stores vector embeddings.
 
-Uses nomic-embed-text-v1.5 via Ollama (768-dim, Matryoshka-capable).
-
 Source-aware chunking (Session 3):
   - pfaf / wikidata / gbif  → single chunk (structured, short)
   - wikipedia / web_ddg* → recursive splitting into ~chunk_size-token pieces
+
+Uses EmbeddingProvider (Session 4) — swappable via EMBED_PROVIDER env var.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from models import RawSource, SourceEmbedding
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from services.llm.provider import LLMProvider
+from services.embeddings.provider import EmbeddingProvider
 from services.rag.chunker import RecursiveTextSplitter
 
 # Sources that receive recursive chunking; all others are kept as one chunk.
@@ -27,7 +27,7 @@ def _should_chunk(source: str) -> bool:
 async def embed_and_store(
     flower_id: int,
     raw_source: RawSource,
-    llm: LLMProvider,
+    embed_provider: EmbeddingProvider,
     session: AsyncSession,
 ) -> list[SourceEmbedding]:
     """Embed a raw source (potentially as multiple chunks) and upsert into source_embeddings."""
@@ -46,8 +46,8 @@ async def embed_and_store(
     else:
         chunks = [text]
 
-    # Batch embed all chunks in one HTTP round-trip if Ollama, else sequential
-    embeddings_vectors = await _batch_embed(chunks, llm)
+    # Batch embed all chunks
+    embeddings_vectors = await embed_provider.embed_batch(chunks)
 
     # Delete existing embeddings for this raw_source
     existing = await session.execute(
@@ -76,7 +76,7 @@ async def embed_and_store(
 
 async def embed_all_sources(
     flower_id: int,
-    llm: LLMProvider,
+    embed_provider: EmbeddingProvider,
     session: AsyncSession,
 ) -> list[SourceEmbedding]:
     """Embed all raw sources for a flower that don't yet have embeddings."""
@@ -89,32 +89,9 @@ async def embed_all_sources(
     for src in sources:
         if not src.raw_content and not src.parsed_content:
             continue
-        embs = await embed_and_store(flower_id, src, llm, session)
+        embs = await embed_and_store(flower_id, src, embed_provider, session)
         all_embeddings.extend(embs)
     return all_embeddings
-
-
-async def _batch_embed(texts: list[str], llm: LLMProvider) -> list[list[float]]:
-    """Embed a list of texts. Uses Ollama /api/embed batch endpoint when available,
-    otherwise falls back to sequential embed() calls."""
-    from services.llm.ollama import OllamaProvider
-
-    if isinstance(llm, OllamaProvider) and len(texts) > 1:
-        import httpx
-        from config import settings
-
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    f"{settings.ollama_base_url}/api/embed",
-                    json={"model": settings.ollama_embed_model, "input": texts},
-                )
-                resp.raise_for_status()
-                return resp.json()["embeddings"]
-        except Exception:
-            pass  # fall through to sequential
-
-    return [await llm.embed(t) for t in texts]
 
 
 def _build_chunk_text(raw_source: RawSource) -> str:

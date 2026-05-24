@@ -25,6 +25,21 @@ class Settings(BaseSettings):
     # sufficient TPM quota (free tier ~14,400 TPM is too low for batch translation).
     translation_provider: str = "ollama"
 
+    # Per-step provider overrides (Session 4)
+    embed_provider: str = "ollama"          # ollama | openai
+    grade_provider: str = ""                # falls back to llm_provider if empty
+    query_gen_provider: str = ""            # falls back to llm_provider if empty
+    judge_provider: str = ""                # falls back to llm_provider if empty
+
+    # Per-step Ollama model overrides
+    grade_model: str = ""                   # e.g. "llama3.2:1b" — falls back to ollama_llm_model
+    query_gen_model: str = ""               # e.g. "llama3.2:3b"
+    synth_model: str = ""                   # e.g. "llama3.2:3b"
+    judge_model: str = ""                   # e.g. "llama3.2:3b"
+
+    # OpenAI embeddings (when EMBED_PROVIDER=openai)
+    openai_embed_model: str = "text-embedding-3-small"
+
     # AWS
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""

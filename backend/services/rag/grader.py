@@ -47,7 +47,7 @@ async def grade_retrieval(
     )
 
     # Parse which chunk numbers the LLM marked as relevant
-    text = response.strip().lower()
+    text = response.text.strip().lower()
     if "none" in text and not any(c.isdigit() for c in text):
         relevant_indices: set[int] = set()
     else:

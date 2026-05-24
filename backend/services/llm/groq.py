@@ -3,6 +3,8 @@ import asyncio
 import httpx
 from config import settings
 
+from services.llm.provider import LLMResponse
+
 _GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 _DEFAULT_MODEL = "llama-3.1-8b-instant"
 _RETRYABLE_CODES = {429, 500, 502, 503, 504}
@@ -15,7 +17,7 @@ class GroqProvider:
         if not self.api_key:
             raise ValueError("GROQ_API_KEY is not set")
 
-    async def complete(self, prompt: str, system: str = "") -> str:
+    async def complete(self, prompt: str, system: str = "") -> LLMResponse:
         from services.llm.rate_limiter import groq_limiter
 
         messages = []
@@ -40,8 +42,6 @@ class GroqProvider:
                     )
 
                 if response.status_code in _RETRYABLE_CODES and attempt < _MAX_ATTEMPTS:
-                    # Respect Retry-After header if present (Groq sends it on 429),
-                    # but cap at 30 s — never block for hours on daily quota exhaustion.
                     retry_after = response.headers.get("retry-after")
                     wait = min(float(retry_after), 30.0) if retry_after else backoff
                     await asyncio.sleep(wait)
@@ -51,16 +51,15 @@ class GroqProvider:
                 response.raise_for_status()
                 data = response.json()
                 usage = data.get("usage", {})
+                tokens = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
                 from services.llm import _token_counter
-                _token_counter.record(
-                    usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-                )
+                _token_counter.record(tokens)
                 content = data["choices"][0]["message"]["content"]
 
                 if not isinstance(content, str) or not content.strip():
                     raise RuntimeError("Groq API returned empty completion content")
 
-                return content
+                return LLMResponse(text=content, tokens_used=tokens)
 
             except (httpx.TimeoutException, httpx.TransportError):
                 if attempt >= _MAX_ATTEMPTS:
@@ -69,9 +68,3 @@ class GroqProvider:
                 backoff = min(backoff * 2, 30.0)
 
         raise RuntimeError("Groq API: max retries exceeded")
-
-    async def embed(self, text: str) -> list[float]:
-        # Groq doesn't offer an embedding endpoint — delegate to Ollama
-        from services.llm.ollama import OllamaProvider
-
-        return await OllamaProvider().embed(text)

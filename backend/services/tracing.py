@@ -7,9 +7,9 @@ Usage in pipeline.py:
         m.api_calls = 4
     tracer.log_summary()
 
-Token counts are captured automatically via the side-channel counter in
-services.llm._token_counter — no change to the LLMProvider Protocol needed.
-Session 4 will replace this with a proper LLMResponse return type.
+Token counts are captured via both the side-channel counter in
+services.llm._token_counter (auto-accumulated by providers) and the
+LLMResponse.tokens_used return value (Session 4).
 """
 from __future__ import annotations
 

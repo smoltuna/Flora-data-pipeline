@@ -177,7 +177,7 @@ async def _batch_translate(
                 f"Output only valid JSON with {lang_name} values."
             ),
         )
-        return _parse_json(response)
+        return _parse_json(response.text)
     except Exception as e:
         log.warning("translation.batch_failed", error=str(e))
         return {}
@@ -198,7 +198,7 @@ async def _fieldwise_translate(
             ),
             system=f"You are a botanical expert. Reply with only the plant name in {lang_name}.",
         )
-        name = resp.strip().strip("\"'")
+        name = resp.text.strip().strip("\"'")
         if name:
             results["name"] = name
     except Exception as e:
@@ -219,7 +219,7 @@ async def _fieldwise_translate(
                     f"Reply with only the translation in {lang_name}."
                 ),
             )
-            val = resp.strip()
+            val = resp.text.strip()
             if val:
                 results[prompt_key] = val
         except Exception as e:

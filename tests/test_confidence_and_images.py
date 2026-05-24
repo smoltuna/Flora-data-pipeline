@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from services.llm.provider import LLMResponse
 from services.rag.synthesizer import NOT_AVAILABLE
 from services.rag.verifier import _parse_verification, verify_all_fields, verify_field
 
@@ -20,11 +21,8 @@ class _MockLLM:
     def __init__(self, response: str = "0.85"):
         self._response = response
 
-    async def complete(self, prompt: str, system: str = "") -> str:
-        return self._response
-
-    async def embed(self, text: str) -> list[float]:
-        return [0.0] * 768
+    async def complete(self, prompt: str, system: str = "") -> LLMResponse:
+        return LLMResponse(text=self._response)
 
 
 @dataclass
@@ -90,10 +88,10 @@ async def test_verify_field_not_available_returns_zero_without_llm_call():
     call_count = 0
 
     class _CountingLLM(_MockLLM):
-        async def complete(self, prompt: str, system: str = "") -> str:
+        async def complete(self, prompt: str, system: str = "") -> LLMResponse:
             nonlocal call_count
             call_count += 1
-            return "0.9"
+            return LLMResponse(text="0.9")
 
     result = await verify_field("fun_fact", NOT_AVAILABLE, "Some source text.", _CountingLLM())
     assert result.confidence == pytest.approx(0.0)

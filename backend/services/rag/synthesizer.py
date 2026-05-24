@@ -119,7 +119,7 @@ async def synthesize(
         "Output only valid JSON.",
     )
 
-    return _parse_response(response)
+    return _parse_response(response.text)
 
 
 def _parse_response(response: str) -> SynthesizedFlower:

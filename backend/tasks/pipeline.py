@@ -25,11 +25,14 @@ import structlog
 from config import settings
 from models import Flower, RawSource
 from routers.scrape import _do_scrape
+from services.embeddings.provider import EmbeddingProvider, get_embedding_provider
 from services.llm.provider import LLMProvider, get_provider
 from services.rag.deduplicator import deduplicate_chunks
 from services.rag.embedder import embed_and_store
 from services.rag.grader import grade_retrieval
-from services.rag.retriever import RetrievedChunk, retrieve_for_flower
+from services.rag.query_gen import generate_field_queries, generate_hyde_document
+from services.rag.retriever import RetrievedChunk, retrieve_for_field, retrieve_for_flower
+from services.rag.router import FIELD_CONFIG, FieldDifficulty
 from services.rag.synthesizer import NOT_AVAILABLE, SynthesizedFlower, synthesize
 from services.rag.verifier import verify_all_fields
 from services.tracing import PipelineTracer
@@ -123,6 +126,8 @@ async def run_pipeline(
             flower.status = "embedding"
             await db.commit()
             llm: LLMProvider = get_provider()
+            embed_provider: EmbeddingProvider = get_embedding_provider()
+            grade_llm: LLMProvider = get_provider(step="grade")
             await db.refresh(flower)
 
             pfaf_raw_care: dict | None = None
@@ -144,7 +149,7 @@ async def run_pipeline(
                 for src in raw_sources:
                     if src.raw_content or src.parsed_content:
                         try:
-                            await embed_and_store(flower_id, src, llm, db)
+                            await embed_and_store(flower_id, src, embed_provider, db)
                             embed_success += 1
                         except Exception as e:
                             embed_failed += 1
@@ -163,11 +168,57 @@ async def run_pipeline(
             if embed_failed:
                 log.info("pipeline.embed_summary", succeeded=embed_success, failed=embed_failed)
 
-            # ── Stage 3: Retrieve ───────────────────────────────────────────
+            # ── Stage 3: Field-specific retrieval ──────────────────────────
+            query_gen_llm: LLMProvider = get_provider(step="query_gen")
+            per_field_chunks: dict[str, list[RetrievedChunk]] = {}
+
             with tracer.step("retrieve") as m:
-                chunks = await retrieve_for_flower(flower_id, db)
+                for field_name, config in FIELD_CONFIG.items():
+                    if config.difficulty == FieldDifficulty.NONE:
+                        continue
+
+                    if config.difficulty == FieldDifficulty.SIMPLE:
+                        queries = [f"{flower.latin_name} {field_name}"]
+                        hyde_doc = None
+                    else:  # COMPLEX
+                        queries = await generate_field_queries(
+                            flower.latin_name, flower.common_name, field_name, query_gen_llm
+                        )
+                        hyde_doc = None
+                        if config.use_hyde:
+                            hyde_doc = await generate_hyde_document(
+                                flower.latin_name, flower.common_name, field_name, query_gen_llm
+                            )
+
+                    field_chunks = await retrieve_for_field(
+                        flower_id=flower_id,
+                        field_name=field_name,
+                        queries=queries,
+                        hyde_doc=hyde_doc,
+                        source_filter=config.sources,
+                        top_k=config.top_k,
+                        db=db,
+                        embed_provider=embed_provider,
+                    )
+                    per_field_chunks[field_name] = field_chunks
+                    log.debug(
+                        "pipeline.field_retrieved",
+                        field=field_name,
+                        difficulty=config.difficulty.value,
+                        n_chunks=len(field_chunks),
+                    )
+
+                # Union per-field chunks into a flat list (dedup by chunk_id)
+                seen_ids: set[int] = set()
+                chunks = []
+                for field_chunks_list in per_field_chunks.values():
+                    for chunk in field_chunks_list:
+                        if chunk.chunk_id not in seen_ids:
+                            seen_ids.add(chunk.chunk_id)
+                            chunks.append(chunk)
                 m.chunks_out = len(chunks)
-            log.info("pipeline.retrieved", n_chunks=len(chunks))
+
+            log.info("pipeline.retrieved", n_chunks=len(chunks), n_fields=len(per_field_chunks))
 
             if not chunks:
                 flower.status = "failed"
@@ -207,8 +258,10 @@ async def run_pipeline(
             with tracer.step("grade") as m:
                 m.chunks_in = len(deduped)
                 for field_name in list(generated_fields.keys()):
+                    # Use field-specific chunks when available — less noise for grader
+                    grade_chunks = per_field_chunks.get(field_name) or deduped
                     grade, _ = await grade_retrieval(
-                        field_name, flower.latin_name, deduped, llm
+                        field_name, flower.latin_name, grade_chunks, grade_llm
                     )
                     if grade == "insufficient":
                         generated_fields[field_name] = NOT_AVAILABLE

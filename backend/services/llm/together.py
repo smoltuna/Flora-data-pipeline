@@ -1,10 +1,10 @@
 import httpx
 from config import settings
 
+from services.llm.provider import LLMResponse
+
 _TOGETHER_CHAT_URL = "https://api.together.xyz/v1/chat/completions"
-_TOGETHER_EMBED_URL = "https://api.together.xyz/v1/embeddings"
 _DEFAULT_LLM = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
-_DEFAULT_EMBED = "togethercomputer/m2-bert-80M-8k-retrieval"
 
 
 class TogetherProvider:
@@ -13,7 +13,7 @@ class TogetherProvider:
         if not self.api_key:
             raise ValueError("TOGETHER_API_KEY is not set")
 
-    async def complete(self, prompt: str, system: str = "") -> str:
+    async def complete(self, prompt: str, system: str = "") -> LLMResponse:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -26,14 +26,12 @@ class TogetherProvider:
                 json={"model": _DEFAULT_LLM, "messages": messages},
             )
             response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
-
-    async def embed(self, text: str) -> list[float]:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                _TOGETHER_EMBED_URL,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": _DEFAULT_EMBED, "input": text},
+            data = response.json()
+            usage = data.get("usage", {})
+            tokens = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+            from services.llm import _token_counter
+            _token_counter.record(tokens)
+            return LLMResponse(
+                text=data["choices"][0]["message"]["content"],
+                tokens_used=tokens,
             )
-            response.raise_for_status()
-            return response.json()["data"][0]["embedding"]

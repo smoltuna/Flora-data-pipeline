@@ -3,8 +3,8 @@
 Each provider calls record() inside complete() after a successful HTTP response.
 PipelineTracer resets the counter at the start of each step and reads it at the end.
 
-This is intentionally simple and single-threaded (asyncio). Session 4 will replace
-this with a proper LLMResponse return type.
+Providers also return tokens via LLMResponse.tokens_used (Session 4), but this
+side-channel remains in use by PipelineTracer for automatic per-step aggregation.
 """
 _tokens: int = 0
 _calls: int = 0

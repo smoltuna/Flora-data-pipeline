@@ -5,7 +5,7 @@ from database import get_db
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from models import Flower
 from pydantic import BaseModel
-from services.llm.provider import get_provider
+from services.embeddings.provider import get_embedding_provider
 from services.rag.deduplicator import deduplicate_chunks
 from services.rag.embedder import embed_all_sources
 from services.rag.retriever import retrieve_for_flower
@@ -72,8 +72,8 @@ async def embed_flower(flower_id: int, db: AsyncSession = Depends(get_db)) -> Em
     if not flower:
         raise HTTPException(status_code=404, detail="Flower not found")
 
-    llm = get_provider()
-    embeddings = await embed_all_sources(flower_id, llm, db)
+    embed_provider = get_embedding_provider()
+    embeddings = await embed_all_sources(flower_id, embed_provider, db)
     return EmbedResult(flower_id=flower_id, embeddings_created=len(embeddings))
 
 
