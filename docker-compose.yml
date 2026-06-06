@@ -19,43 +19,51 @@ services:
         limits:
           memory: 1G
 
-  ollama:
-    image: ollama/ollama:latest
+  tempo:
+    image: grafana/tempo:2.7.2
+    command: ["-config.file=/etc/tempo.yaml"]
     ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    entrypoint:
-      - /bin/bash
-      - -c
-      - |
-        ollama serve &
-        until ollama list > /dev/null 2>&1; do sleep 1; done
-        ollama pull nomic-embed-text
-        ollama pull llama3.2:3b
-        wait
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 10s
-      timeout: 15s
-      retries: 60
-      start_period: 120s
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-
-  jaeger:
-    image: jaegertracing/all-in-one:1.76.0
-    ports:
-      - "16686:16686"  # UI
       - "4317:4317"    # OTLP gRPC
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
+      - "3200:3200"    # Tempo HTTP (Grafana datasource)
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo.yaml
+      - tempo_data:/var/tempo
     deploy:
       resources:
         limits:
           memory: 512M
+
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  grafana:
+    image: grafana/grafana:11.6.1
+    ports:
+      - "3001:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - tempo
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.19.0
@@ -77,16 +85,15 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql+asyncpg://flora:flora@postgres:5432/flora
-      OLLAMA_BASE_URL: http://ollama:11434
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4317
+      MLFLOW_TRACKING_URI: http://mlflow:5000
     env_file:
       - .env
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
-      jaeger:
+      tempo:
         condition: service_started
     working_dir: /app/backend
     volumes:
@@ -110,5 +117,7 @@ services:
 
 volumes:
   postgres_data:
-  ollama_data:
   mlflow_data:
+  tempo_data:
+  prometheus_data:
+  grafana_data:
