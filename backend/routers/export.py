@@ -1,4 +1,4 @@
-"""Export endpoint — trigger xcassets export for a flower or all complete flowers."""
+"""Export endpoint — build the FlowerAssets.xcassets bundle."""
 from __future__ import annotations
 
 import json
@@ -6,8 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from database import get_db
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends
 from models import Flower, RawSource, Translation
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -166,64 +165,11 @@ class ExportResult(BaseModel):
     output_path: str
 
 
-@router.get("/{flower_id}")
-async def export_flower(flower_id: int, db: AsyncSession = Depends(get_db)) -> JSONResponse:
-    """Return the Flora-compatible JSON payload for a single flower from the xcassets bundle."""
-    flower = await db.get(Flower, flower_id)
-    if not flower:
-        raise HTTPException(status_code=404, detail="Flower not found")
-
-    if flower.status not in ("enriched", "images_done", "complete"):
-        raise HTTPException(status_code=400, detail="Flower not yet enriched")
-
-    flowers_json = _DEFAULT_XCASSETS_DIR / "flowers.dataset" / "flowers.json"
-    if not flowers_json.exists():
-        raise HTTPException(
-            status_code=503,
-            detail="xcassets bundle not built yet — run POST /export/xcassets first",
-        )
-
-    payloads = json.loads(flowers_json.read_text())
-    entry = next((p for p in payloads if p.get("latinName") == flower.latin_name), None)
-    if entry is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"{flower.latin_name!r} not in bundle — run POST /export/xcassets first",
-        )
-
-    return JSONResponse(content=entry)
-
-
-@router.post("/batch", response_model=ExportResult)
-async def export_batch(output_dir: str = "/tmp/flora_export") -> ExportResult:
-    """Write individual flower JSON files from the xcassets bundle."""
-    flowers_json = _DEFAULT_XCASSETS_DIR / "flowers.dataset" / "flowers.json"
-    if not flowers_json.exists():
-        raise HTTPException(
-            status_code=503,
-            detail="xcassets bundle not built yet — run POST /export/xcassets first",
-        )
-
-    payloads = json.loads(flowers_json.read_text())
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    for payload in payloads:
-        filename = payload["latinName"].replace(" ", "_").lower() + ".json"
-        (out_path / filename).write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-
-    return ExportResult(exported=len(payloads), output_path=str(out_path))
-
-
-@router.post("/xcassets", response_model=ExportResult)
-async def export_xcassets(
-    output_dir: str | None = None,
-    db: AsyncSession = Depends(get_db),
-) -> ExportResult:
-    """Write the complete FlowerAssets.xcassets bundle (Contents.json + flowers.dataset/)."""
-    xcassets_dir = Path(output_dir) if output_dir else _DEFAULT_XCASSETS_DIR
-    count = await build_xcassets_bundle(db, xcassets_dir)
-    return ExportResult(exported=count, output_path=str(xcassets_dir))
+@router.post("", response_model=ExportResult)
+async def export_xcassets(db: AsyncSession = Depends(get_db)) -> ExportResult:
+    """Build the FlowerAssets.xcassets bundle from all enriched flowers."""
+    count = await build_xcassets_bundle(db, _DEFAULT_XCASSETS_DIR)
+    return ExportResult(exported=count, output_path=str(_DEFAULT_XCASSETS_DIR))
 
 
 async def build_xcassets_bundle(db: AsyncSession, xcassets_dir: Path) -> int:

@@ -15,8 +15,8 @@ export default function FlowerDetailPage() {
   const [flower, setFlower] = useState<Flower | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [scraping, setScraping] = useState(false);
-  const [enriching, setEnriching] = useState(false);
+  const [runningData, setRunningData] = useState(false);
+  const [runningImages, setRunningImages] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -34,29 +34,29 @@ export default function FlowerDetailPage() {
 
   useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleScrape = async () => {
+  const handleRunData = async () => {
     if (!flower) return;
-    setScraping(true);
+    setRunningData(true);
     try {
-      await api.scrape.run(flower.id);
+      await api.flowers.runData(flower.id);
       await load();
     } catch (e) {
       setError(String(e));
     } finally {
-      setScraping(false);
+      setRunningData(false);
     }
   };
 
-  const handleEnrich = async () => {
+  const handleRunImages = async () => {
     if (!flower) return;
-    setEnriching(true);
+    setRunningImages(true);
     try {
-      await api.enrich.run(flower.id);
+      await api.flowers.runImages(flower.id);
       await load();
     } catch (e) {
       setError(String(e));
     } finally {
-      setEnriching(false);
+      setRunningImages(false);
     }
   };
 
@@ -82,18 +82,18 @@ export default function FlowerDetailPage() {
 
         <div className="flex gap-2 flex-shrink-0">
           <button
-            onClick={handleScrape}
-            disabled={scraping}
-            className="text-sm px-4 py-2 rounded-lg border border-gray-300 bg-white hover:bg-gray-50 disabled:opacity-50 transition-colors"
-          >
-            {scraping ? "Scraping..." : "Run Scrape"}
-          </button>
-          <button
-            onClick={handleEnrich}
-            disabled={enriching || !["scraped", "enriched"].includes(flower.status)}
+            onClick={handleRunData}
+            disabled={runningData}
             className="text-sm px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition-colors"
           >
-            {enriching ? "Enriching..." : "Run Enrich"}
+            {runningData ? "Running data..." : "Run Data"}
+          </button>
+          <button
+            onClick={handleRunImages}
+            disabled={runningImages || !["enriched", "images_done", "complete"].includes(flower.status)}
+            className="text-sm px-4 py-2 rounded-lg border border-gray-300 bg-white hover:bg-gray-50 disabled:opacity-50 transition-colors"
+          >
+            {runningImages ? "Running images..." : "Run Images"}
           </button>
         </div>
       </div>
@@ -112,7 +112,7 @@ export default function FlowerDetailPage() {
                   <div>
                     <p className="text-xs text-gray-400 mb-1">Info</p>
                     <img
-                      src={`${process.env.NEXT_PUBLIC_API_URL ?? ""}/images/${flower.id}/serve/info`}
+                      src={`${process.env.NEXT_PUBLIC_API_URL ?? ""}/flowers/${flower.id}/images/info`}
                       alt={`${flower.latin_name} info`}
                       className="w-full rounded-lg border border-gray-100 object-cover"
                       style={{ maxHeight: "180px" }}
@@ -126,7 +126,7 @@ export default function FlowerDetailPage() {
                   <div>
                     <p className="text-xs text-gray-400 mb-1">Transparent blossom</p>
                     <img
-                      src={`${process.env.NEXT_PUBLIC_API_URL ?? ""}/images/${flower.id}/serve/main`}
+                      src={`${process.env.NEXT_PUBLIC_API_URL ?? ""}/flowers/${flower.id}/images/main`}
                       alt={`${flower.latin_name} blossom`}
                       className="w-full rounded-lg object-contain bg-gray-50"
                       style={{ maxHeight: "180px" }}
@@ -137,7 +137,7 @@ export default function FlowerDetailPage() {
                   <div>
                     <p className="text-xs text-gray-400 mb-1">Lock screen</p>
                     <img
-                      src={`${process.env.NEXT_PUBLIC_API_URL ?? ""}/images/${flower.id}/serve/lock`}
+                      src={`${process.env.NEXT_PUBLIC_API_URL ?? ""}/flowers/${flower.id}/images/lock`}
                       alt={`${flower.latin_name} lock`}
                       className="w-full rounded-lg object-cover"
                       style={{ maxHeight: "100px" }}

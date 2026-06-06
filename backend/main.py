@@ -10,7 +10,7 @@ from opentelemetry.exporter.prometheus import PrometheusMetricReader
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.metrics import MeterProvider
 from prometheus_client import make_asgi_app
-from routers import enrich, export, flowers, images, scrape, translate
+from routers import export, flowers
 from services.observability import setup_observability
 
 
@@ -51,10 +51,6 @@ app.mount("/metrics", metrics_app)
 
 # Routers
 app.include_router(flowers.router, prefix="/flowers", tags=["flowers"])
-app.include_router(scrape.router, prefix="/scrape", tags=["scrape"])
-app.include_router(enrich.router, prefix="/enrich", tags=["enrich"])
-app.include_router(images.router, prefix="/images", tags=["images"])
-app.include_router(translate.router, prefix="/translate", tags=["translate"])
 app.include_router(export.router, prefix="/export", tags=["export"])
 
 

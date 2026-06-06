@@ -1,4 +1,4 @@
-import type { Flower, FlowerCreate, ScrapeResult, EnrichResult } from "@/types/flower";
+import type { Flower, FlowerCreate } from "@/types/flower";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "/api";
 
@@ -11,6 +11,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const text = await res.text();
     throw new Error(`API ${res.status}: ${text}`);
   }
+  if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
 }
 
@@ -24,17 +25,13 @@ export const api = {
     create: (body: FlowerCreate): Promise<Flower> =>
       request<Flower>("/flowers", { method: "POST", body: JSON.stringify(body) }),
     delete: (id: number): Promise<void> => request<void>(`/flowers/${id}`, { method: "DELETE" }),
+    runData: (id: number): Promise<Flower> =>
+      request<Flower>(`/flowers/${id}/data`, { method: "POST" }),
+    runImages: (id: number): Promise<Flower> =>
+      request<Flower>(`/flowers/${id}/images`, { method: "POST" }),
   },
-  scrape: {
-    run: (flowerId: number): Promise<ScrapeResult> =>
-      request<ScrapeResult>(`/scrape/${flowerId}/sync`, { method: "POST" }),
-  },
-  enrich: {
-    run: (flowerId: number): Promise<EnrichResult> =>
-      request<EnrichResult>(`/enrich/${flowerId}/sync`, { method: "POST" }),
-    chunks: (flowerId: number, deduplicated?: boolean): Promise<unknown[]> => {
-      const qs = deduplicated ? "?deduplicated=true" : "";
-      return request<unknown[]>(`/enrich/${flowerId}/chunks${qs}`);
-    },
+  export: {
+    xcassets: (): Promise<{ exported: number; output_path: string }> =>
+      request<{ exported: number; output_path: string }>("/export", { method: "POST" }),
   },
 };

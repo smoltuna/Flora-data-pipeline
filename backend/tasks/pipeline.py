@@ -25,7 +25,7 @@ import mlflow
 import structlog
 from config import settings
 from models import Flower, RawSource
-from routers.scrape import _do_scrape
+from services.scraper.orchestrator import scrape_all_sources
 from services.embeddings.provider import EmbeddingProvider, get_embedding_provider
 from services.llm.provider import LLMProvider, get_provider
 from services.observability import get_tracer, step_span
@@ -117,7 +117,7 @@ async def run_pipeline(
             flower.status = "scraping"
             await db.commit()
             with step_span("scrape") as span:
-                scrape_result = await _do_scrape(flower_id, flower.latin_name, db)
+                scrape_result = await scrape_all_sources(flower_id, flower.latin_name, db)
                 span.set_attribute(
                     "api_calls",
                     len(scrape_result.sources_scraped) + len(scrape_result.sources_failed),

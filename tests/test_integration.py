@@ -173,29 +173,3 @@ async def test_delete_flower(client: AsyncClient):
     assert get_resp.status_code == 404
 
 
-@pytest.mark.asyncio
-async def test_flower_status_endpoint(client: AsyncClient):
-    create_resp = await client.post(
-        "/flowers", json={"latin_name": "Testus statuscheck"},
-    )
-    flower_id = create_resp.json()["id"]
-
-    resp = await client.get(f"/flowers/{flower_id}/status")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["status"] == "pending"
-    assert data["sources_scraped"] == []
-
-
-# ── Export endpoint ──────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_export_pending_flower_returns_400(client: AsyncClient):
-    """Export requires enriched status; pending flowers should be rejected."""
-    create_resp = await client.post(
-        "/flowers", json={"latin_name": "Testus exportpending"},
-    )
-    flower_id = create_resp.json()["id"]
-
-    resp = await client.get(f"/export/{flower_id}")
-    assert resp.status_code == 400
