@@ -22,9 +22,6 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Care info — canonical icon+label mapping
 # ---------------------------------------------------------------------------
-# All 12 valid icon+label pairs. Labels are the export canonical names.
-# PFAF value strings (exact and variant) are mapped here.
-# ---------------------------------------------------------------------------
 
 _CARE_LABEL_MAP: dict[str, dict] = {
     # ── Sun / shade ──────────────────────────────────────────────────────────
@@ -66,14 +63,12 @@ _CARE_LABEL_MAP: dict[str, dict] = {
     "subtropical": {"icon": "snowflake", "label": "Tender"},
 }
 
-# Table keys that indicate this row is NOT care info (skip entirely)
 _SKIP_KEYS = frozenset([
     "cultivation details", "cultivation", "propagation", "edibility",
     "medicinal", "other uses", "edible", "weed potential", "habitats",
     "notes", "synonyms", "family",
 ])
 
-# Values that mean nothing useful (skip the value but still check the key)
 _SKIP_VALUES = frozenset([
     "not specified", "n/a", "unknown", "information not available",
     "usda", "none", "no information",
@@ -85,10 +80,8 @@ def _match_care_value(text: str) -> dict | None:
     v = text.strip().lower()
     if not v or v in _SKIP_VALUES:
         return None
-    # Exact match first
     if v in _CARE_LABEL_MAP:
         return _CARE_LABEL_MAP[v]
-    # Longest-prefix substring match
     best: tuple[int, dict] | None = None
     for key, entry in _CARE_LABEL_MAP.items():
         if key in v or v in key:
@@ -98,17 +91,10 @@ def _match_care_value(text: str) -> dict | None:
 
 
 def _normalize_care_info(care_info) -> list[dict]:
-    """Normalise care_info to the canonical [{icon, label}] list.
-
-    Accepts:
-      - list of {icon, label} dicts (already canonical — pass through)
-      - dict from PFAF raw table parsing (keys = PFAF row labels, values = PFAF row text)
-      - dict from LLM synthesis (keys like "sun", "soil", values like "Full sun")
-    """
+    """Normalise care_info to the canonical [{icon, label}] list."""
     if not care_info:
         return []
 
-    # Already canonical
     if isinstance(care_info, list):
         valid = [
             item for item in care_info
@@ -128,27 +114,17 @@ def _normalize_care_info(care_info) -> list[dict]:
 
         for raw_key, raw_val in care_info.items():
             key = raw_key.strip().lower()
-
-            # Skip non-care rows
             if any(skip in key for skip in _SKIP_KEYS):
                 continue
-
-            # PFAF often puts multiple conditions in one cell, comma-separated
             parts = [p.strip() for p in str(raw_val).split(",") if p.strip()]
-
             for part in parts:
-                # 1. Try the value directly
                 entry = _match_care_value(part)
                 if entry:
                     _add(entry)
                     continue
-
-                # 2. If value is boolean-like ("Yes"), treat the key as the value
                 if part.lower() in ("yes", "true", "y", "1"):
                     _add(_match_care_value(key))
                     continue
-
-                # 3. Key + value combined (e.g. key="Shade", val="Semi" → "shade semi")
                 _add(_match_care_value(f"{key} {part}"))
 
         return result
@@ -192,7 +168,7 @@ class ExportResult(BaseModel):
 
 @router.get("/{flower_id}")
 async def export_flower(flower_id: int, db: AsyncSession = Depends(get_db)) -> JSONResponse:
-    """Return the Flora-compatible JSON payload for a single flower."""
+    """Return the Flora-compatible JSON payload for a single flower from the xcassets bundle."""
     flower = await db.get(Flower, flower_id)
     if not flower:
         raise HTTPException(status_code=404, detail="Flower not found")
@@ -200,44 +176,43 @@ async def export_flower(flower_id: int, db: AsyncSession = Depends(get_db)) -> J
     if flower.status not in ("enriched", "images_done", "complete"):
         raise HTTPException(status_code=400, detail="Flower not yet enriched")
 
-    translations_result = await db.execute(
-        select(Translation).where(Translation.flower_id == flower_id)
-    )
-    translations = translations_result.scalars().all()
+    flowers_json = _DEFAULT_XCASSETS_DIR / "flowers.dataset" / "flowers.json"
+    if not flowers_json.exists():
+        raise HTTPException(
+            status_code=503,
+            detail="xcassets bundle not built yet — run POST /export/xcassets first",
+        )
 
-    # Prefer PFAF raw care_info (exact labels) over synthesized version
-    pfaf_care = await _fetch_pfaf_care_info(flower_id, db)
+    payloads = json.loads(flowers_json.read_text())
+    entry = next((p for p in payloads if p.get("latinName") == flower.latin_name), None)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{flower.latin_name!r} not in bundle — run POST /export/xcassets first",
+        )
 
-    payload = _build_payload(flower, translations, pfaf_care)
-    return JSONResponse(content=payload)
+    return JSONResponse(content=entry)
 
 
 @router.post("/batch", response_model=ExportResult)
-async def export_batch(
-    output_dir: str = "/tmp/flora_export",
-    db: AsyncSession = Depends(get_db),
-) -> ExportResult:
-    """Export all enriched flowers to JSON files in the Flora xcassets format."""
-    result = await db.execute(
-        select(Flower).where(Flower.status.in_(["enriched", "images_done", "complete"]))
-    )
-    flowers = result.scalars().all()
+async def export_batch(output_dir: str = "/tmp/flora_export") -> ExportResult:
+    """Write individual flower JSON files from the xcassets bundle."""
+    flowers_json = _DEFAULT_XCASSETS_DIR / "flowers.dataset" / "flowers.json"
+    if not flowers_json.exists():
+        raise HTTPException(
+            status_code=503,
+            detail="xcassets bundle not built yet — run POST /export/xcassets first",
+        )
 
+    payloads = json.loads(flowers_json.read_text())
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    for flower in flowers:
-        trans_result = await db.execute(
-            select(Translation).where(Translation.flower_id == flower.id)
-        )
-        translations = trans_result.scalars().all()
-        pfaf_care = await _fetch_pfaf_care_info(flower.id, db)
-        payload = _build_payload(flower, translations, pfaf_care)
-        (out_path / f"{flower.latin_name.replace(' ', '_').lower()}.json").write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False)
-        )
+    for payload in payloads:
+        filename = payload["latinName"].replace(" ", "_").lower() + ".json"
+        (out_path / filename).write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
-    return ExportResult(exported=len(flowers), output_path=str(out_path))
+    return ExportResult(exported=len(payloads), output_path=str(out_path))
 
 
 @router.post("/xcassets", response_model=ExportResult)
@@ -288,7 +263,6 @@ def _write_xcassets_files(xcassets_dir: Path, payloads: list[dict]) -> None:
         json.dumps({"info": {"author": "xcode", "version": 1}}, indent=2)
     )
 
-    # flowers.dataset/
     dataset_dir = xcassets_dir / "flowers.dataset"
     dataset_dir.mkdir(exist_ok=True)
 
@@ -307,14 +281,9 @@ def _build_payload(
     translations: list[Translation] | Sequence[Translation],
     pfaf_care: dict | None = None,
 ) -> dict:
-    """Build Flora-compatible JSON matching flowers.json schema.
-
-    care_info priority: PFAF raw table data > flowers.care_info (synthesized)
-    """
+    """Build Flora-compatible JSON matching flowers.json schema."""
     trans_map: dict[str, Translation] = {t.language: t for t in translations}
     stem = _image_stem(flower.latin_name)
-
-    # Use PFAF raw care_info if available, fall back to synthesized
     care_source = pfaf_care if pfaf_care else flower.care_info
 
     def localized(field: str, lang: str) -> str | None:

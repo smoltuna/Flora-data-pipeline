@@ -28,6 +28,7 @@ from models import Flower, RawSource
 from routers.scrape import _do_scrape
 from services.embeddings.provider import EmbeddingProvider, get_embedding_provider
 from services.llm.provider import LLMProvider, get_provider
+from services.observability import get_tracer, step_span
 from services.rag.deduplicator import deduplicate_chunks
 from services.rag.embedder import embed_and_store
 from services.rag.extractor import extract_field_facts
@@ -38,7 +39,6 @@ from services.rag.retriever import RetrievedChunk, hybrid_retrieve
 from services.rag.router import FIELD_CONFIG, FieldDifficulty
 from services.rag.synthesizer import NOT_AVAILABLE, synthesize
 from services.rag.verifier import verify_all_fields
-from services.tracing import PipelineTracer
 from services.translation.translator import translate_flower
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -83,7 +83,6 @@ async def run_pipeline(
     flower_id: int,
     db: AsyncSession,
     feature_date: date | None = None,
-    _batch_traces: list[dict] | None = None,
     _images_fn: Callable[[], Awaitable[None]] | None = None,
 ) -> Flower:
     """Run the full enrichment pipeline for a single flower. Returns the updated Flower."""
@@ -91,7 +90,6 @@ async def run_pipeline(
     if not flower:
         raise ValueError(f"Flower {flower_id} not found")
 
-    tracer = PipelineTracer(flower_id, flower.latin_name)
     log.info("pipeline.start", flower_id=flower_id, latin_name=flower.latin_name)
     start_time = time.perf_counter()
 
@@ -100,7 +98,11 @@ async def run_pipeline(
     deduped: list[RetrievedChunk] = []
     confidence_scores: dict = {}
 
-    with _mlflow_context(flower.latin_name, flower_id):
+    otel_tracer = get_tracer()
+    with otel_tracer.start_as_current_span(
+        "flower",
+        attributes={"latin_name": flower.latin_name, "flower_id": flower_id},
+    ), _mlflow_context(flower.latin_name, flower_id):
         try:
             mlflow.set_tags({
                 "latin_name": flower.latin_name,
@@ -114,10 +116,11 @@ async def run_pipeline(
             # ── Stage 1: Scrape ─────────────────────────────────────────────
             flower.status = "scraping"
             await db.commit()
-            with tracer.step("scrape") as m:
+            with step_span("scrape") as span:
                 scrape_result = await _do_scrape(flower_id, flower.latin_name, db)
-                m.api_calls = (
-                    len(scrape_result.sources_scraped) + len(scrape_result.sources_failed)
+                span.set_attribute(
+                    "api_calls",
+                    len(scrape_result.sources_scraped) + len(scrape_result.sources_failed),
                 )
             log.info(
                 "pipeline.scraped",
@@ -136,7 +139,7 @@ async def run_pipeline(
             pfaf_raw_care: dict | None = None
             embed_success = 0
             embed_failed = 0
-            with tracer.step("embed") as m:
+            with step_span("embed") as span:
                 sources_result = await db.execute(
                     select(RawSource).where(RawSource.flower_id == flower_id)
                 )
@@ -157,8 +160,8 @@ async def run_pipeline(
                         except Exception as e:
                             embed_failed += 1
                             log.warning("pipeline.embed_failed", source=src.source, error=str(e))
-                m.api_calls = embed_success + embed_failed
-                m.chunks_out = embed_success
+                span.set_attribute("api_calls", embed_success + embed_failed)
+                span.set_attribute("chunks_out", embed_success)
 
             if raw_sources and embed_success == 0:
                 flower.status = "failed"
@@ -175,7 +178,7 @@ async def run_pipeline(
             query_gen_llm: LLMProvider = get_provider(step="query_gen")
             per_field_chunks: dict[str, list[RetrievedChunk]] = {}
 
-            with tracer.step("retrieve") as m:
+            with step_span("retrieve") as span:
                 for field_name, config in FIELD_CONFIG.items():
                     if config.difficulty == FieldDifficulty.NONE:
                         continue
@@ -218,7 +221,7 @@ async def run_pipeline(
                         if chunk.chunk_id not in seen_ids:
                             seen_ids.add(chunk.chunk_id)
                             chunks.append(chunk)
-                m.chunks_out = len(chunks)
+                span.set_attribute("chunks_out", len(chunks))
 
             log.info("pipeline.retrieved", n_chunks=len(chunks), n_fields=len(per_field_chunks))
 
@@ -232,8 +235,8 @@ async def run_pipeline(
 
             # ── Stage 4: CRAG grade + correct ──────────────────────────────
             graded_per_field: dict[str, list[RetrievedChunk]] = {}
-            with tracer.step("grade") as m:
-                m.chunks_in = len(chunks)
+            with step_span("grade") as span:
+                span.set_attribute("chunks_in", len(chunks))
                 for field_name, field_chunks_list in per_field_chunks.items():
                     field_cfg = FIELD_CONFIG[field_name]
                     final_chunks, grade = await grade_and_correct(
@@ -256,16 +259,16 @@ async def run_pipeline(
                         seen_graded.add(chunk.chunk_id)
                         all_graded_chunks.append(chunk)
 
-            with tracer.step("dedup") as m:
+            with step_span("dedup") as span:
                 deduped = deduplicate_chunks(all_graded_chunks)
-                m.chunks_in = len(all_graded_chunks)
-                m.chunks_out = len(deduped)
+                span.set_attribute("chunks_in", len(all_graded_chunks))
+                span.set_attribute("chunks_out", len(deduped))
             log.info("pipeline.deduped", before=len(all_graded_chunks), after=len(deduped))
 
             # ── Stage 5: Extract facts for COMPLEX fields ───────────────────
             field_context: dict[str, list[RetrievedChunk] | str] = {}
-            with tracer.step("extract") as m:
-                m.chunks_in = len(all_graded_chunks)
+            with step_span("extract") as span:
+                span.set_attribute("chunks_in", len(all_graded_chunks))
                 for field_name, field_chunks_list in graded_per_field.items():
                     if not field_chunks_list:
                         continue  # insufficient → absent from context → NOT_AVAILABLE
@@ -280,11 +283,11 @@ async def run_pipeline(
                         field_context[field_name] = field_chunks_list
 
             # ── Stage 6: Synthesize ─────────────────────────────────────────
-            with tracer.step("synthesize") as m:
+            with step_span("synthesize") as span:
                 synthesis_result = await synthesize(
                     flower.latin_name, flower.common_name, field_context, llm
                 )
-                m.chunks_in = len(all_graded_chunks)
+                span.set_attribute("chunks_in", len(all_graded_chunks))
 
             # ── Stage 7: Self-RAG verification ─────────────────────────────
             _source_order = {"wikipedia": 0, "wikidata": 1, "gbif": 2, "pfaf": 3}
@@ -297,7 +300,7 @@ async def run_pipeline(
                 for f in TEXT_FIELDS
                 if getattr(synthesis_result, f, NOT_AVAILABLE) != NOT_AVAILABLE
             }
-            with tracer.step("verify") as m:
+            with step_span("verify"):
                 verification_results = await verify_all_fields(
                     fields_to_verify, source_text, llm,
                     field_chunks={f: graded_per_field.get(f, []) for f in fields_to_verify},
@@ -310,7 +313,7 @@ async def run_pipeline(
 
             # ── Stage 7b: LLM-as-Judge ─────────────────────────────────────
             judge_llm: LLMProvider = get_provider(step="judge")
-            with tracer.step("judge") as m:
+            with step_span("judge"):
                 judge_scores = await judge_flower(
                     flower.latin_name,
                     fields_to_verify,
@@ -348,19 +351,19 @@ async def run_pipeline(
             log.info("pipeline.translating", flower_id=flower_id)
 
             async def _translate_traced() -> None:
-                with tracer.step("translate") as m:
+                with step_span("translate") as span:
                     try:
                         await translate_flower(flower_id, db)
                         log.info("pipeline.translated", flower_id=flower_id)
                     except Exception as e:
                         log.warning("pipeline.translate_failed", flower_id=flower_id, error=str(e))
-                        m.errors.append(str(e))
+                        span.record_exception(e)
 
             if _images_fn is not None:
                 async def _images_traced() -> None:
-                    with tracer.step("images") as m:
+                    with step_span("images") as span:
                         await _images_fn()
-                        m.api_calls = 3  # wikimedia + fal main + fal lock
+                        span.set_attribute("api_calls", 3)  # wikimedia + fal main + fal lock
 
                 await asyncio.gather(_translate_traced(), _images_traced())
             else:
@@ -370,9 +373,6 @@ async def run_pipeline(
             elapsed = time.perf_counter() - start_time
             if chunks:
                 _log_mlflow_metrics(confidence_scores, len(chunks), len(deduped), elapsed)
-            tracer.log_summary()
-            if _batch_traces is not None:
-                _batch_traces.append(tracer.summary())
             log.info(
                 "pipeline.complete",
                 flower_id=flower_id,

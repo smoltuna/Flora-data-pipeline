@@ -6,13 +6,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from log_config import configure_logging
 from opentelemetry import metrics as otel_metrics
-from opentelemetry import trace
 from opentelemetry.exporter.prometheus import PrometheusMetricReader
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.trace import TracerProvider
 from prometheus_client import make_asgi_app
 from routers import enrich, export, flowers, images, scrape, translate
+from services.observability import setup_observability
 
 
 @asynccontextmanager
@@ -36,16 +35,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OpenTelemetry — traces
-tracer_provider = TracerProvider()
-trace.set_tracer_provider(tracer_provider)
+# OpenTelemetry — traces (OTLP → Jaeger) + MLflow sink. See services/observability.py.
+setup_observability()
 
 # OpenTelemetry — metrics exported to Prometheus
 _prometheus_reader = PrometheusMetricReader()
 _meter_provider = MeterProvider(metric_readers=[_prometheus_reader])
 otel_metrics.set_meter_provider(_meter_provider)
 
-FastAPIInstrumentor.instrument_app(app, tracer_provider=tracer_provider)
+FastAPIInstrumentor.instrument_app(app)
 
 # Prometheus scrape endpoint (consumed by the OTel metrics reader above)
 metrics_app = make_asgi_app()

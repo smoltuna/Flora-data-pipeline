@@ -216,8 +216,6 @@ Flora-Asset-Pipeline/
 ├── scripts/
 │   ├── run_all.py               # Full pipeline (--skip-images, --skip-data, --limit)
 │   └── start_services.sh        # Docker service startup with preflight checks
-├── infra/
-│   └── ollama-entrypoint.sh     # Pulls llama3.2:3b + nomic-embed-text on container start
 ├── output/                      # Generated — FlowerAssets.xcassets/ written here
 ├── .env.example
 └── docker-compose.yml           # PostgreSQL · Ollama · MLflow · backend · frontend

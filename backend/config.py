@@ -40,12 +40,6 @@ class Settings(BaseSettings):
     # OpenAI embeddings (when EMBED_PROVIDER=openai)
     openai_embed_model: str = "text-embedding-3-small"
 
-    # AWS
-    aws_access_key_id: str = ""
-    aws_secret_access_key: str = ""
-    aws_region: str = "us-east-1"
-    s3_bucket: str = "flora-assets"
-
     # fal.ai (vision judge + FLUX lock icon generation)
     fal_key: str = ""
 

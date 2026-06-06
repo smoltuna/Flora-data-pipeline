@@ -1,10 +1,8 @@
 """Side-channel token counter for LLM providers.
 
 Each provider calls record() inside complete() after a successful HTTP response.
-PipelineTracer resets the counter at the start of each step and reads it at the end.
-
-Providers also return tokens via LLMResponse.tokens_used (Session 4), but this
-side-channel remains in use by PipelineTracer for automatic per-step aggregation.
+services.observability.step_span() resets the counter on span entry and reads it
+on span exit, attaching the total as a `tokens_used` span attribute.
 """
 _tokens: int = 0
 _calls: int = 0

@@ -22,11 +22,11 @@ FLOWERS = [
 
 # Feature dates: flower[0] gets START_DATE, flower[1] gets START_DATE+1, etc.
 from datetime import date, timedelta
+
 START_DATE = date(2026, 5, 1)
 
-import asyncio
 import argparse
-import json
+import asyncio
 import os
 import sys
 import time
@@ -35,17 +35,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import structlog  # noqa: E402
-from sqlalchemy import select  # noqa: E402
-
 from config import settings  # noqa: E402
 from database import async_session_factory, create_tables  # noqa: E402
 from log_config import configure_logging  # noqa: E402
 from models import Flower  # noqa: E402
-from tasks.pipeline import run_pipeline  # noqa: E402
-from services.images.wikimedia import find_images  # noqa: E402
-from services.images.processor import process_info_image, process_main_image  # noqa: E402
-from services.images.lock_gen import generate_lock_image  # noqa: E402
 from routers.export import build_xcassets_bundle  # noqa: E402
+from services.images.lock_gen import generate_lock_image  # noqa: E402
+from services.images.processor import process_info_image, process_main_image  # noqa: E402
+from services.images.wikimedia import find_images  # noqa: E402
+from services.observability import (  # noqa: E402
+    batch_summary,
+    setup_observability,
+    shutdown_observability,
+)
+from sqlalchemy import select  # noqa: E402
+from tasks.pipeline import run_pipeline  # noqa: E402
 
 log = structlog.get_logger()
 
@@ -129,28 +133,6 @@ def _eta(elapsed: float, done: int, total: int) -> float | None:
     return round((elapsed / done) * remaining, 1) if remaining > 0 else 0.0
 
 
-def _write_trace(batch_traces: list[dict], total_elapsed: float) -> None:
-    """Write batch trace summary to output/trace_{timestamp}.json."""
-    output_dir = Path(__file__).parent.parent / "output"
-    output_dir.mkdir(exist_ok=True)
-    timestamp = int(time.time())
-    trace_path = output_dir / f"trace_{timestamp}.json"
-    payload = {
-        "timestamp": timestamp,
-        "total_elapsed_s": round(total_elapsed, 3),
-        "n_flowers": len(batch_traces),
-        "batch_totals": {
-            "tokens": sum(t.get("total_tokens", 0) for t in batch_traces),
-            "llm_calls": sum(t.get("total_llm_calls", 0) for t in batch_traces),
-            "api_calls": sum(t.get("total_api_calls", 0) for t in batch_traces),
-        },
-        "flowers": batch_traces,
-    }
-    trace_path.write_text(json.dumps(payload, indent=2))
-    log.info("run_all.trace_written", path=str(trace_path))
-    return trace_path
-
-
 def _print_summary(batch_traces: list[dict], total_elapsed: float) -> None:
     """Print a human-readable summary table to stdout."""
     if not batch_traces:
@@ -212,6 +194,7 @@ async def main(
     limit: int | None = None,
 ) -> None:
     configure_logging()
+    setup_observability(include_batch_summary=True)
     await create_tables()
 
     if latin_names and not skip_data:
@@ -226,12 +209,14 @@ async def main(
 
     log.info("run_all.start", n_flowers=total, skip_images=skip_images, skip_data=skip_data)
     batch_start = time.perf_counter()
-    batch_traces: list[dict] = []
 
     # Shared counters — safe without locks since asyncio is single-threaded.
     counts: dict[str, int] = {"data_ok": 0, "data_fail": 0, "img_ok": 0, "img_fail": 0}
 
-    sem = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_FLOWERS", "3")))
+    # Default 1: local Ollama on CPU serializes inference anyway, so concurrency just adds
+    # queue contention and risks the 300s httpx timeout. Bump via env var for cloud LLM
+    # providers (Groq/Gemini/etc.) where concurrent flowers actually parallelize.
+    sem = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_FLOWERS", "1")))
 
     def _make_images_fn(flower_id: int, latin_name: str):
         """Return an async callable that fetches + processes images for one flower."""
@@ -280,7 +265,6 @@ async def main(
                         await run_pipeline(
                             flower.id, session,
                             feature_date=feature_date,
-                            _batch_traces=batch_traces,
                             _images_fn=images_fn,
                         )
                         counts["data_ok"] += 1
@@ -350,11 +334,10 @@ async def main(
 
     total_elapsed = time.perf_counter() - batch_start
 
-    # ── Write batch trace ───────────────────────────────────────────────────────
-    if batch_traces:
-        trace_path = _write_trace(batch_traces, total_elapsed)
-        print(f"Trace written to:\n  {trace_path}")
-        _print_summary(batch_traces, total_elapsed)
+    # ── Per-flower step summary (read from OTel BatchSummaryProcessor) ─────────
+    trace_snapshot = batch_summary.snapshot()
+    if trace_snapshot:
+        _print_summary(trace_snapshot, total_elapsed)
 
     log.info(
         "run_all.complete",
@@ -365,6 +348,8 @@ async def main(
         total=total,
         elapsed_s=round(total_elapsed, 1),
     )
+
+    shutdown_observability()
 
 
 def _parse_args() -> argparse.Namespace:
