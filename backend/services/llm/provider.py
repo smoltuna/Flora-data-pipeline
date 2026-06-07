@@ -20,9 +20,10 @@ def get_provider(
 ) -> LLMProvider:
     """Return an LLM provider instance.
 
-    If *step* is given (e.g. "grade", "query_gen", "judge"), the per-step
-    provider and model settings are used when available, falling back to
-    the default LLM_PROVIDER / OLLAMA_LLM_MODEL.
+    If *step* is given (e.g. "grade", "query_gen", "judge", "synth",
+    "translation", "fact_check"), the per-step provider and model settings
+    are used when available, falling back to the default LLM_PROVIDER /
+    OLLAMA_LLM_MODEL.
     """
     from config import settings
 

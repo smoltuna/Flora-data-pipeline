@@ -1,24 +1,25 @@
 """RAG-grounded translation service.
 
 Strategy:
-  - Provider: uses settings.translation_provider (default: "ollama" — no rate limits).
-    Set TRANSLATION_PROVIDER=groq only with a paid account; free Groq TPM (~14,400/min)
-    is far too low for batch translation.
-  - FORCE_FIELDWISE=True (default): each field is translated with a separate plain-text
-    call. More reliable for small models (llama3.2:3b) at the cost of more LLM round trips.
-    Set FORCE_FIELDWISE=False to try a single batched JSON call first, falling back to
-    per-field calls if the batch response is too sparse (< MIN_BATCH_FIELDS fields).
-  - Languages are processed sequentially to avoid bursting any rate limits.
-  - Input fields are truncated to MAX_FIELD_CHARS to keep prompts manageable.
+  - `name` field: try Wikidata P1843 / GBIF vernacular names from the DB first
+    (already scraped, no extra HTTP). If unavailable, ask the LLM with the
+    English source as context. If the result fails sanity checks, fall back to
+    the Latin name — we never persist made-up names.
+  - Body fields: each is translated with a separate plain-text call grounded
+    in the English source text. Sanity checks drop rejected fields rather than
+    persisting garbage.
+  - Provider: defaults to ollama (step="translation"), so TRANSLATION_MODEL=qwen2.5:7b
+    in .env routes translation through a stronger multilingual model without
+    touching the rest of the pipeline.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 
 import structlog
-from models import Flower, Translation
+from models import Flower, RawSource, Translation
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.llm.provider import get_provider
@@ -26,7 +27,8 @@ from services.llm.provider import get_provider
 
 def _get_translation_provider():
     from config import settings
-    return get_provider(settings.translation_provider)
+    return get_provider(settings.translation_provider, step="translation")
+
 
 log = structlog.get_logger()
 
@@ -46,7 +48,6 @@ TEXT_FIELDS = [
     "habitat", "etymology", "cultural_info",
 ]
 
-# camelCase keys used in LLM prompts (avoids underscore escaping issues in JSON)
 _FIELD_PROMPT_KEY = {
     "description": "description",
     "fun_fact": "funFact",
@@ -57,36 +58,46 @@ _FIELD_PROMPT_KEY = {
 }
 _REVERSE_KEY = {v: k for k, v in _FIELD_PROMPT_KEY.items()}
 
-# Truncate each field to this many chars before sending to LLM (controls token usage)
 MAX_FIELD_CHARS = 600
+MAX_NAME_CHARS = 60
+MIN_BODY_CHARS = 20
+MIN_NAME_CHARS = 2
 
-# Minimum number of successfully translated fields to accept a batch response.
-# If the batch produces fewer than this, missing fields are filled in with
-# individual fieldwise calls (hybrid approach).
-MIN_BATCH_FIELDS = 3
+# Scripts: ja/zh outputs must contain CJK; de/fr/es/it must NOT be mostly CJK.
+_CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿]")
+_HIRAGANA_KATAKANA_RE = re.compile(r"[぀-ヿ]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
 
-# Set to True to always use field-by-field mode (skip the batch attempt entirely).
-# llama3.2:3b can't reliably produce batch JSON under concurrent load —
-# the failed attempt wastes time before falling back. Keep fieldwise until
-# Session 4 adds per-step provider config (Groq handles batch JSON well).
-FORCE_FIELDWISE = True
+# Phrases the small LLM tends to leak into output (translator notes, planning).
+# Two layers:
+#   1) "Nota:"/"Note:" + colon at line start — English/Romance translator notes.
+#   2) Chinese instruction/error phrases qwen sometimes emits mid-output, like
+#      "原句中断" ("sentence interrupted"), "原消息已结束" ("message ended"),
+#      "请提供" ("please provide"). These appear inside DE/FR/IT fields when qwen
+#      thinks in Chinese mid-generation. Catch any of these substrings.
+_META_LEAK_RE = re.compile(
+    r"(?:^|\n)\s*(?:Nota|Note|Notes|Traduzione|Translator|Translator's note)\s*[:：\-]"
+    r"|(?:^|\W)(?:translation note|Latin translation|備考|译注|翻译注|译者注|訳注)(?:[:：\s]|$)"
+    r"|原句|原消息|原文|请提供|请检查|无法完成|未能提供|保持不变|特别注意|翻译中",
+    re.IGNORECASE,
+)
+
+# Bullet/list markers — body text should be prose, not a checklist
+_BULLET_RE = re.compile(r"^\s*[-*•]\s+", re.MULTILINE)
 
 
 async def translate_flower(flower_id: int, session: AsyncSession) -> None:
-    """Translate all text fields + common name for a flower into all supported languages.
-
-    All 6 languages are translated concurrently via asyncio.gather. Within each language,
-    fields are processed sequentially for prompt coherence. DB writes are performed
-    sequentially after all LLM calls complete to avoid concurrent session access.
-    """
+    """Translate all text fields + common name for a flower into all supported languages."""
     flower = await session.get(Flower, flower_id)
     if not flower:
         return
 
+    scraped_names = await _load_scraped_common_names(session, flower_id)
+
     async def _safe_translate(lang: str) -> tuple[str, dict[str, str | None] | None]:
         log.info("translation.start", flower_id=flower_id, lang=lang)
         try:
-            fields = await _get_fields(flower, lang)
+            fields = await _get_fields(flower, lang, scraped_names.get(lang))
             return lang, fields
         except Exception as e:
             log.error("translation.error", flower_id=flower_id, lang=lang, error=str(e))
@@ -94,7 +105,6 @@ async def translate_flower(flower_id: int, session: AsyncSession) -> None:
 
     results = await asyncio.gather(*[_safe_translate(lang) for lang in sorted(ALL_LANGUAGES)])
 
-    # Write results to DB sequentially (shared session must not be accessed concurrently)
     for lang, fields in results:
         if fields is not None:
             await _upsert_translation(
@@ -102,12 +112,68 @@ async def translate_flower(flower_id: int, session: AsyncSession) -> None:
             )
 
 
-async def _get_fields(flower: Flower, lang: str) -> dict[str, str | None]:
-    """Run LLM translation for one language. Returns field dict without touching the DB."""
+# GBIF returns ISO 639-3 (3-letter) language codes; the rest of the pipeline
+# uses ISO 639-1 (2-letter). Map the languages we care about.
+_ISO3_TO_ISO1 = {
+    "deu": "de", "ger": "de",
+    "fra": "fr", "fre": "fr",
+    "spa": "es",
+    "ita": "it",
+    "jpn": "ja",
+    "zho": "zh", "chi": "zh", "cmn": "zh",
+    "eng": "en",
+}
+
+
+async def _load_scraped_common_names(
+    session: AsyncSession, flower_id: int
+) -> dict[str, str]:
+    """Read Wikidata P1843 + GBIF vernacular names for this flower from the DB.
+
+    Returns {lang: name} merged across sources, preferring Wikidata (canonical
+    labels) over GBIF (community-curated). Language codes are normalised to
+    ISO 639-1 (de/fr/es/it/ja/zh) — GBIF emits 639-3 so we translate them.
+    """
+    result = await session.execute(
+        select(RawSource).where(
+            RawSource.flower_id == flower_id,
+            RawSource.source.in_(("wikidata", "gbif")),
+        )
+    )
+    rows = result.scalars().all()
+
+    gbif_names: dict[str, str] = {}
+    wikidata_names: dict[str, str] = {}
+    for row in rows:
+        parsed = row.parsed_content or {}
+        if row.source == "wikidata":
+            names = parsed.get("common_names") or {}
+            if isinstance(names, dict):
+                wikidata_names = {
+                    k: v for k, v in names.items()
+                    if isinstance(v, str) and v.strip()
+                }
+        elif row.source == "gbif":
+            names = parsed.get("vernacular_names") or {}
+            if isinstance(names, dict):
+                for raw_lang, name in names.items():
+                    if not (isinstance(name, str) and name.strip()):
+                        continue
+                    lang_key = _ISO3_TO_ISO1.get(raw_lang, raw_lang)
+                    # Don't overwrite an existing GBIF entry — first match wins
+                    gbif_names.setdefault(lang_key, name)
+
+    merged = {**gbif_names, **wikidata_names}  # wikidata wins on key collisions
+    return merged
+
+
+async def _get_fields(
+    flower: Flower, lang: str, scraped_name: str | None
+) -> dict[str, str | None]:
+    """Run LLM translation for one language, with scraped-name lookup + sanity checks."""
     llm = _get_translation_provider()
     lang_name = LANG_NAMES[lang]
 
-    # Collect non-empty source fields (truncated)
     source: dict[str, str] = {}
     for field in TEXT_FIELDS:
         text = getattr(flower, field, None)
@@ -115,86 +181,83 @@ async def _get_fields(flower: Flower, lang: str) -> dict[str, str | None]:
             source[_FIELD_PROMPT_KEY[field]] = text[:MAX_FIELD_CHARS]
 
     common = flower.common_name or flower.latin_name
+    body_only = {k: v for k, v in source.items() if k != "name"}
 
-    # ── Attempt 1: batched JSON call (skipped when FORCE_FIELDWISE is set) ────
-    if FORCE_FIELDWISE or not source:
-        translated: dict[str, str] = {}
-    else:
-        translated = await _batch_translate(llm, flower.latin_name, common, lang_name, source)
+    translated = await _fieldwise_translate(
+        llm, flower.latin_name, common, lang, lang_name, body_only,
+    )
 
-    # ── Attempt 2: fill gaps with field-by-field calls for missing fields ──
-    batch_count = len([v for v in translated.values() if v])
-    missing_source = {
-        k: v for k, v in source.items() if k not in translated or not translated.get(k)
-    }
-    # Also check if common name is missing
-    if "name" not in translated:
-        missing_source["_need_name"] = ""
+    # ── Resolve `name` field: Wikidata/GBIF → sanity-checked LLM → Latin ──
+    name = _resolve_name(
+        scraped_name=scraped_name,
+        llm_name=translated.get("name"),
+        lang=lang,
+        latin_name=flower.latin_name,
+    )
 
-    if missing_source and (FORCE_FIELDWISE or batch_count < MIN_BATCH_FIELDS):
-        if not FORCE_FIELDWISE and batch_count > 0:
-            log.info("translation.filling_gaps", flower_id=flower.id, lang=lang,
-                     batch_got=batch_count, filling=len(missing_source))
-        gap_fields = await _fieldwise_translate(
-            llm, flower.latin_name, common, lang_name,
-            {k: v for k, v in missing_source.items() if k != "_need_name"},
-        )
-        # Merge: batch results take priority, gaps fill in the rest
-        for k, v in gap_fields.items():
-            if k not in translated or not translated.get(k):
-                translated[k] = v
-
-    # Map camelCase prompt keys back to snake_case model fields
-    fields: dict[str, str | None] = {"name": translated.get("name") or None}
+    # ── Sanity-check body fields, drop rejected ──
+    fields: dict[str, str | None] = {"name": name}
     for prompt_key, field_name in _REVERSE_KEY.items():
         val = translated.get(prompt_key)
-        fields[field_name] = val.strip() if val else None
+        if val:
+            val = val.strip()
+        if val and _sanity_check_body(val, lang):
+            fields[field_name] = val
+        else:
+            if val:
+                log.info(
+                    "translation.field_rejected",
+                    flower_id=flower.id, lang=lang, field=field_name,
+                    preview=val[:80],
+                )
+            fields[field_name] = None
 
     n = len([v for v in fields.values() if v])
     log.info("translation.done", flower_id=flower.id, lang=lang, n_fields=n)
     return fields
 
 
-async def _batch_translate(
-    llm, latin_name: str, common_name: str, lang_name: str, source: dict[str, str]
-) -> dict:
-    """Single LLM call: translate all fields at once. Returns parsed dict (may be empty)."""
-    source_json = json.dumps(source, ensure_ascii=False, indent=2)
-    prompt = (
-        f"Translate all JSON fields below into {lang_name} for the plant "
-        f"{latin_name} (English common name: {common_name}).\n\n"
-        f"Also add a \"name\" field with the proper {lang_name} botanical common name "
-        f"(e.g. the actual local name, not a literal word-for-word translation).\n\n"
-        f"Source (English):\n{source_json}\n\n"
-        f'Return ONLY a valid JSON object with the same keys '
-        f'plus "name". No markdown, no explanation.'
-    )
-    try:
-        response = await llm.complete(
-            prompt=prompt,
-            system=(
-                f"You are a precise botanical translator. "
-                f"Output only valid JSON with {lang_name} values."
-            ),
-        )
-        return _parse_json(response.text)
-    except Exception as e:
-        log.warning("translation.batch_failed", error=str(e))
-        return {}
+def _resolve_name(
+    scraped_name: str | None, llm_name: str | None, lang: str, latin_name: str
+) -> str:
+    """Pick a name in priority order. Never returns hallucinated junk.
+
+    Order: Wikidata/GBIF scraped name → sanity-passing LLM name → Latin name.
+    """
+    if scraped_name and _sanity_check_name(scraped_name, lang):
+        return scraped_name.strip()
+    if llm_name:
+        llm_name = llm_name.strip().strip("\"'.,;:")
+        if _sanity_check_name(llm_name, lang):
+            return llm_name
+        log.info("translation.name_rejected", lang=lang, preview=llm_name[:60])
+    return latin_name
 
 
 async def _fieldwise_translate(
-    llm, latin_name: str, common_name: str, lang_name: str, source: dict[str, str]
+    llm,
+    latin_name: str,
+    common_name: str,
+    lang: str,
+    lang_name: str,
+    source: dict[str, str],
 ) -> dict:
-    """Translate each field with a simple plain-text prompt, then reassemble."""
+    """Translate name + each body field, grounding every prompt in the English source."""
     results: dict[str, str] = {}
 
-    # Translate common name
+    # Name: ask for the LOCAL common name only, not a calque of the English name.
     try:
         resp = await llm.complete(
             prompt=(
-                f"What is the common name for {latin_name} ({common_name}) in {lang_name}? "
-                f"Reply with only the {lang_name} name, nothing else."
+                f"Provide the local common name in {lang_name} for the plant "
+                f"{latin_name} (English: {common_name}).\n\n"
+                f"Rules:\n"
+                f"- Reply with ONLY the {lang_name} name, no quotes, no parens, "
+                f"no explanation.\n"
+                f"- Use the established {lang_name} botanical common name, not a "
+                f"word-for-word translation.\n"
+                f"- If no established {lang_name} common name exists, reply exactly: "
+                f"{latin_name}\n"
             ),
             system=f"You are a botanical expert. Reply with only the plant name in {lang_name}.",
         )
@@ -204,15 +267,19 @@ async def _fieldwise_translate(
     except Exception as e:
         log.warning("translation.name_failed", lang=lang_name, error=str(e))
 
-    # Translate each text field
+    # Body fields: each gets the English source as the ONLY source.
     for prompt_key, text in source.items():
         try:
             resp = await llm.complete(
                 prompt=(
-                    f"Translate the following botanical text "
-                    f"about {latin_name} into {lang_name}.\n\n"
-                    f"{text}\n\n"
-                    f"Reply with only the {lang_name} translation, nothing else."
+                    f"Translate the following botanical text about {latin_name} "
+                    f"into {lang_name}.\n\n"
+                    f"English source:\n{text}\n\n"
+                    f"Rules:\n"
+                    f"- Translate faithfully — do not add, remove, or invent facts.\n"
+                    f"- Keep proper nouns ({latin_name}) in Latin.\n"
+                    f"- Reply with ONLY the {lang_name} translation as prose. "
+                    f"No bullets, no notes, no commentary.\n"
                 ),
                 system=(
                     f"You are a botanical translator. "
@@ -228,18 +295,66 @@ async def _fieldwise_translate(
     return results
 
 
-def _parse_json(response: str) -> dict:
-    """Extract a JSON object from an LLM response, stripping markdown fences."""
-    text = re.sub(r"```(?:json)?\s*", "", response).strip().rstrip("`").strip()
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start == -1 or end == 0:
-        return {}
-    try:
-        data = json.loads(text[start:end])
-        return {k: v for k, v in data.items() if isinstance(v, str) and v.strip()}
-    except json.JSONDecodeError:
-        return {}
+def _sanity_check_name(value: str, lang: str) -> bool:
+    """Reject names that are too short, too long, wrong-script, or contain meta-commentary."""
+    if not value:
+        return False
+    v = value.strip()
+    if len(v) < MIN_NAME_CHARS or len(v) > MAX_NAME_CHARS:
+        return False
+    # No leaked meta-commentary
+    if _META_LEAK_RE.search(v):
+        return False
+    # Names are short — multi-line responses are wrong
+    if "\n" in v:
+        return False
+    # Script check: ja/zh names must be either pure CJK or pure Latin (the
+    # latin-name fallback). Mixed scripts (e.g. 'ばらすいkusen', 'ツルイチゴ…andesia')
+    # are LLM garbage and must be rejected.
+    if lang in ("ja", "zh"):
+        cjk = bool(_CJK_RE.search(v))
+        latin = bool(_LATIN_RE.search(v))
+        if cjk and latin:
+            return False
+        if not cjk and not latin:
+            return False
+    else:
+        # Latin-script langs: should be mostly Latin letters, not mostly CJK
+        cjk = len(_CJK_RE.findall(v))
+        latin = len(_LATIN_RE.findall(v))
+        if cjk > latin:
+            return False
+    # Reject if value is only punctuation/whitespace
+    if not re.search(r"\w", v):
+        return False
+    return True
+
+
+def _sanity_check_body(value: str, lang: str) -> bool:
+    """Reject body text that's too short, wrong-script, bulleted, or contains meta-commentary."""
+    if not value:
+        return False
+    v = value.strip()
+    if len(v) < MIN_BODY_CHARS:
+        return False
+    if _META_LEAK_RE.search(v):
+        return False
+    if _BULLET_RE.search(v):
+        return False
+    if lang in ("ja", "zh"):
+        # Must contain CJK
+        if not _CJK_RE.search(v):
+            return False
+        # Japanese must have hiragana or katakana — pure-kanji is usually Chinese mis-tag
+        if lang == "ja" and not _HIRAGANA_KATAKANA_RE.search(v):
+            return False
+    else:
+        # Latin-script langs: ZERO tolerance for CJK. Any CJK character means
+        # qwen is leaking Chinese mid-output (commentary, error msgs, or
+        # mis-translated fragments). Drop the field rather than persist mixed text.
+        if _CJK_RE.search(v):
+            return False
+    return True
 
 
 async def _upsert_translation(
@@ -249,7 +364,6 @@ async def _upsert_translation(
     fields: dict[str, str | None],
     source_method: str,
 ) -> None:
-    from sqlalchemy import select
     existing = await session.execute(
         select(Translation).where(
             Translation.flower_id == flower_id,

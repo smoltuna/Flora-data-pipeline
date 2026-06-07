@@ -34,8 +34,15 @@ class Settings(BaseSettings):
     # Per-step Ollama model overrides
     grade_model: str = ""                   # e.g. "llama3.2:1b" — falls back to ollama_llm_model
     query_gen_model: str = ""               # e.g. "llama3.2:3b"
-    synth_model: str = ""                   # e.g. "llama3.2:3b"
+    synth_model: str = ""                   # e.g. "qwen2.5:7b" — recommended for fewer hallucinations
     judge_model: str = ""                   # e.g. "llama3.2:3b"
+    translation_model: str = ""             # e.g. "qwen2.5:7b" — strong multilingual on M4 Metal
+    fact_check_model: str = ""              # e.g. "qwen2.5:7b" — used to compare claim vs web snippet
+
+    # Post-synthesis web fact-check for COMPLEX fields (etymology, cultural_info, fun_fact).
+    # Runs a targeted DDG search per field, compares the synthesized claim to the top snippet,
+    # regenerates the field if they disagree. Bounds the LLM cost by capping to one regen.
+    fact_check_enabled: bool = True
 
     # OpenAI embeddings (when EMBED_PROVIDER=openai)
     openai_embed_model: str = "text-embedding-3-small"

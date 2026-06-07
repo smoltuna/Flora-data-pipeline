@@ -39,6 +39,7 @@ from services.observability import (
 from services.rag.deduplicator import deduplicate_chunks
 from services.rag.embedder import embed_and_store
 from services.rag.extractor import extract_field_facts
+from services.rag.fact_checker import fact_check_fields
 from services.rag.grader import grade_and_correct
 from services.rag.judge import judge_flower
 from services.rag.query_gen import generate_field_queries, generate_hyde_document
@@ -138,7 +139,7 @@ async def run_pipeline(
             # ── Stage 2: Embed ──────────────────────────────────────────────
             flower.status = "embedding"
             await db.commit()
-            llm: LLMProvider = get_provider()
+            llm: LLMProvider = get_provider(step="synth")
             embed_provider: EmbeddingProvider = get_embedding_provider()
             grade_llm: LLMProvider = get_provider(step="grade")
             await db.refresh(flower)
@@ -296,6 +297,29 @@ async def run_pipeline(
                     flower.latin_name, flower.common_name, field_context, llm
                 )
                 span.set_attribute("chunks_in", len(all_graded_chunks))
+
+            # ── Stage 6b: Post-synthesis web fact-check for COMPLEX fields ─
+            # Catches hallucinations the synthesizer makes over correct chunks
+            # (e.g. Tulipa etymology wrote "Joannes Andreae Gesner" when Wikipedia
+            # says Conrad Gesner). One regen per field, gated by config flag.
+            fact_check_llm: LLMProvider = get_provider(step="fact_check")
+            with step_span("fact_check") as span:
+                synth_for_check = {
+                    f: getattr(synthesis_result, f, NOT_AVAILABLE)
+                    for f in ("etymology", "cultural_info", "fun_fact")
+                }
+                checks = await fact_check_fields(
+                    flower.latin_name, flower.common_name,
+                    synth_for_check, fact_check_llm,
+                )
+                n_regen = 0
+                for field_name, result in checks.items():
+                    if result.corrected:
+                        setattr(synthesis_result, field_name, result.corrected)
+                        n_regen += 1
+                span.set_attribute("regenerated", n_regen)
+            if checks:
+                log.info("pipeline.fact_checked", n_checked=len(checks), n_regen=n_regen)
 
             # ── Stage 7: Self-RAG verification ─────────────────────────────
             _source_order = {"wikipedia": 0, "wikidata": 1, "gbif": 2, "pfaf": 3}
