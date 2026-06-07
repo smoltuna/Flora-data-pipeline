@@ -27,12 +27,22 @@ class FieldConfig:
 # "web_ddg" matches any source starting with "web_ddg" (web_ddg_0, web_ddg_1, …)
 # "all" means no source filter — search across all sources for this flower.
 FIELD_CONFIG: dict[str, FieldConfig] = {
-    "description":      FieldConfig(FieldDifficulty.SIMPLE,  sources=["wikipedia", "pfaf"],             top_k=3),
-    "wiki_description": FieldConfig(FieldDifficulty.SIMPLE,  sources=["wikipedia"],                     top_k=2),
-    "habitat":          FieldConfig(FieldDifficulty.SIMPLE,  sources=["pfaf", "gbif", "wikipedia"],     top_k=3),
-    "care_info":        FieldConfig(FieldDifficulty.NONE),
-    "petal_color_hex":  FieldConfig(FieldDifficulty.SIMPLE,  sources=["wikipedia", "web_ddg"],          top_k=2),
-    "etymology":        FieldConfig(FieldDifficulty.COMPLEX, sources=["all"],  top_k=5, use_hyde=True),
-    "cultural_info":    FieldConfig(FieldDifficulty.COMPLEX, sources=["all"],  top_k=5, use_hyde=True),
-    "fun_fact":         FieldConfig(FieldDifficulty.COMPLEX, sources=["all"],  top_k=5, use_hyde=False),
+    "description": FieldConfig(FieldDifficulty.SIMPLE, sources=["wikipedia", "pfaf"], top_k=3),
+    "wiki_description": FieldConfig(FieldDifficulty.SIMPLE, sources=["wikipedia"], top_k=2),
+    "habitat": FieldConfig(
+        FieldDifficulty.SIMPLE, sources=["pfaf", "gbif", "wikipedia"], top_k=3,
+    ),
+    "care_info": FieldConfig(FieldDifficulty.NONE),
+    "petal_color_hex": FieldConfig(
+        FieldDifficulty.SIMPLE, sources=["wikipedia", "web_ddg"], top_k=2,
+    ),
+    "etymology": FieldConfig(
+        FieldDifficulty.COMPLEX, sources=["all"], top_k=5, use_hyde=True,
+    ),
+    "cultural_info": FieldConfig(
+        FieldDifficulty.COMPLEX, sources=["all"], top_k=5, use_hyde=True,
+    ),
+    "fun_fact": FieldConfig(
+        FieldDifficulty.COMPLEX, sources=["all"], top_k=5, use_hyde=False,
+    ),
 }

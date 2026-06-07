@@ -57,6 +57,7 @@ async def fact_check_fields(
     corrected values back to the Flower row.
     """
     from config import settings
+
     from services.scraper.web_search import search_web
 
     if not settings.fact_check_enabled:

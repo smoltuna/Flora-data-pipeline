@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     together_api_key: str = ""
     openai_api_key: str = ""
 
-    llm_provider: str = "ollama"  # ollama | gemini | groq | together | openai
+    llm_provider: str = "ollama"  # ollama | gemini | groq | together
 
     # Separate provider for translation — defaults to ollama (no rate limits, runs locally).
     # Set TRANSLATION_PROVIDER=groq in .env only if you have a paid Groq account with
@@ -34,10 +34,10 @@ class Settings(BaseSettings):
     # Per-step Ollama model overrides
     grade_model: str = ""                   # e.g. "llama3.2:1b" — falls back to ollama_llm_model
     query_gen_model: str = ""               # e.g. "llama3.2:3b"
-    synth_model: str = ""                   # e.g. "qwen2.5:7b" — recommended for fewer hallucinations
+    synth_model: str = ""                   # e.g. "qwen2.5:7b" for fewer hallucinations
     judge_model: str = ""                   # e.g. "llama3.2:3b"
-    translation_model: str = ""             # e.g. "qwen2.5:7b" — strong multilingual on M4 Metal
-    fact_check_model: str = ""              # e.g. "qwen2.5:7b" — used to compare claim vs web snippet
+    translation_model: str = ""             # e.g. "qwen2.5:7b" for multilingual on Metal
+    fact_check_model: str = ""              # e.g. "qwen2.5:7b" compares claim vs snippet
 
     # Post-synthesis web fact-check for COMPLEX fields (etymology, cultural_info, fun_fact).
     # Runs a targeted DDG search per field, compares the synthesized claim to the top snippet,

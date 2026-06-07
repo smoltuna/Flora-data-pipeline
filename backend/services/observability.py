@@ -164,6 +164,8 @@ class _MLflowSpanProcessor(SpanProcessor):
             import mlflow
             if not mlflow.active_run():
                 return
+            if span.end_time is None or span.start_time is None:
+                return
             duration_s = (span.end_time - span.start_time) / 1_000_000_000.0
             name = span.name
             attrs = span.attributes or {}
@@ -181,7 +183,7 @@ class _MLflowSpanProcessor(SpanProcessor):
             metrics: dict[str, float] = {f"trace_{name}_s": duration_s}
             for key in ("tokens_used", "llm_calls", "api_calls", "chunks_in", "chunks_out"):
                 v = attrs.get(key)
-                if v:
+                if isinstance(v, (int, float)):
                     # Normalize "tokens_used" → "tokens" for backward-compatible metric names.
                     metric_key = "tokens" if key == "tokens_used" else key
                     metrics[f"trace_{name}_{metric_key}"] = float(v)
@@ -216,6 +218,8 @@ class _BatchSummaryProcessor(SpanProcessor):
 
     def on_end(self, span: ReadableSpan) -> None:
         trace_id = span.context.trace_id
+        if span.end_time is None or span.start_time is None:
+            return
         duration_s = (span.end_time - span.start_time) / 1_000_000_000.0
         attrs = span.attributes or {}
         entry = self.flowers[trace_id]
@@ -226,8 +230,10 @@ class _BatchSummaryProcessor(SpanProcessor):
             entry["total_s"] = duration_s
             return
 
-        tokens = int(attrs.get("tokens_used", 0) or 0)
-        calls = int(attrs.get("llm_calls", 0) or 0)
+        raw_tokens = attrs.get("tokens_used", 0) or 0
+        raw_calls = attrs.get("llm_calls", 0) or 0
+        tokens = int(raw_tokens) if isinstance(raw_tokens, (int, float)) else 0
+        calls = int(raw_calls) if isinstance(raw_calls, (int, float)) else 0
         entry["steps"][span.name] = {
             "duration_s": duration_s,
             "tokens": tokens,

@@ -60,9 +60,15 @@ class Flower(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    raw_sources: Mapped[list["RawSource"]] = relationship(back_populates="flower", cascade="all, delete-orphan")
-    embeddings: Mapped[list["SourceEmbedding"]] = relationship(back_populates="flower", cascade="all, delete-orphan")
-    translations: Mapped[list["Translation"]] = relationship(back_populates="flower", cascade="all, delete-orphan")
+    raw_sources: Mapped[list["RawSource"]] = relationship(
+        back_populates="flower", cascade="all, delete-orphan"
+    )
+    embeddings: Mapped[list["SourceEmbedding"]] = relationship(
+        back_populates="flower", cascade="all, delete-orphan"
+    )
+    translations: Mapped[list["Translation"]] = relationship(
+        back_populates="flower", cascade="all, delete-orphan"
+    )
 
 
 class RawSource(Base):

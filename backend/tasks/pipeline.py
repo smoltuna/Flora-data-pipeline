@@ -25,7 +25,6 @@ import mlflow
 import structlog
 from config import settings
 from models import Flower, RawSource
-from services.scraper.orchestrator import scrape_all_sources
 from services.embeddings.provider import EmbeddingProvider, get_embedding_provider
 from services.llm.provider import LLMProvider, get_provider
 from services.observability import (
@@ -47,6 +46,7 @@ from services.rag.retriever import RetrievedChunk, hybrid_retrieve
 from services.rag.router import FIELD_CONFIG, FieldDifficulty
 from services.rag.synthesizer import NOT_AVAILABLE, synthesize
 from services.rag.verifier import verify_all_fields
+from services.scraper.orchestrator import scrape_all_sources
 from services.translation.translator import translate_flower
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession

@@ -282,16 +282,3 @@ async def search_wikimedia(latin_name: str) -> list[WikimediaImage]:
 
     return candidates
 
-
-# ---------------------------------------------------------------------------
-# Legacy API — kept for backwards compatibility with existing callers
-# ---------------------------------------------------------------------------
-
-async def find_images(latin_name: str) -> ImagePair:
-    """Return the best (info, blossom) pair from Wikimedia Commons.
-
-    DEPRECATED: Use search.find_images() instead for multi-source results.
-    Kept for backwards compatibility.
-    """
-    from services.images.search import find_images as _find
-    return await _find(latin_name)

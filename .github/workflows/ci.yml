@@ -13,21 +13,6 @@ permissions:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg17
-        env:
-          POSTGRES_USER: flora
-          POSTGRES_PASSWORD: flora
-          POSTGRES_DB: flora
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +33,36 @@ jobs:
       - name: Type check with mypy
         run: uv run mypy backend/ --ignore-missing-imports
 
+      # Pull pgvector image with retry: Docker Hub on GitHub runners
+      # periodically times out. Wrap the pull so a transient blip
+      # doesn't fail the whole job.
+      - name: Pull pgvector image (with retry)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 5
+          retry_wait_seconds: 15
+          command: docker pull pgvector/pgvector:pg17
+
+      - name: Start postgres
+        run: |
+          docker run -d --name postgres \
+            -e POSTGRES_USER=flora \
+            -e POSTGRES_PASSWORD=flora \
+            -e POSTGRES_DB=flora \
+            -p 5432:5432 \
+            pgvector/pgvector:pg17
+          for i in $(seq 1 30); do
+            if docker exec postgres pg_isready -U flora >/dev/null 2>&1; then
+              echo "postgres ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "postgres did not become ready in time" >&2
+          docker logs postgres
+          exit 1
+
       - name: Run tests
         run: uv run pytest tests/ -v
         env:
@@ -62,8 +77,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pre-pull the buildkit image with retry so setup-buildx-action
+      # doesn't fail when Docker Hub flakes.
+      - name: Pre-pull buildkit (with retry)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 3
+          max_attempts: 5
+          retry_wait_seconds: 10
+          command: docker pull moby/buildkit:buildx-stable-1
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:buildx-stable-1
 
       - name: Log in to ghcr.io
         if: env.PUSH == 'true'

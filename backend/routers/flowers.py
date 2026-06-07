@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from database import async_session_factory, get_db
+from database import get_db
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from models import Flower
@@ -109,7 +109,7 @@ async def run_image_pipeline(flower_id: int, db: AsyncSession = Depends(get_db))
     from config import settings
     from services.images.lock_gen import generate_lock_image
     from services.images.processor import process_info_image, process_main_image
-    from services.images.wikimedia import find_images
+    from services.images.search import find_images
 
     flower = await db.get(Flower, flower_id)
     if not flower:

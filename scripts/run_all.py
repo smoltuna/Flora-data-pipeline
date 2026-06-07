@@ -42,7 +42,7 @@ from models import Flower  # noqa: E402
 from routers.export import build_xcassets_bundle  # noqa: E402
 from services.images.lock_gen import generate_lock_image  # noqa: E402
 from services.images.processor import process_info_image, process_main_image  # noqa: E402
-from services.images.wikimedia import find_images  # noqa: E402
+from services.images.search import find_images  # noqa: E402
 from services.observability import (  # noqa: E402
     batch_summary,
     setup_observability,

@@ -157,7 +157,8 @@ async def _load_scraped_common_names(
             names = parsed.get("vernacular_names") or {}
             if isinstance(names, dict):
                 for raw_lang, name in names.items():
-                    if not (isinstance(name, str) and name.strip()):
+                    if not (isinstance(raw_lang, str) and isinstance(name, str)
+                            and name.strip()):
                         continue
                     lang_key = _ISO3_TO_ISO1.get(raw_lang, raw_lang)
                     # Don't overwrite an existing GBIF entry — first match wins
@@ -181,10 +182,9 @@ async def _get_fields(
             source[_FIELD_PROMPT_KEY[field]] = text[:MAX_FIELD_CHARS]
 
     common = flower.common_name or flower.latin_name
-    body_only = {k: v for k, v in source.items() if k != "name"}
 
     translated = await _fieldwise_translate(
-        llm, flower.latin_name, common, lang, lang_name, body_only,
+        llm, flower.latin_name, common, lang, lang_name, source,
     )
 
     # ── Resolve `name` field: Wikidata/GBIF → sanity-checked LLM → Latin ──
@@ -320,9 +320,9 @@ def _sanity_check_name(value: str, lang: str) -> bool:
             return False
     else:
         # Latin-script langs: should be mostly Latin letters, not mostly CJK
-        cjk = len(_CJK_RE.findall(v))
-        latin = len(_LATIN_RE.findall(v))
-        if cjk > latin:
+        cjk_count = len(_CJK_RE.findall(v))
+        latin_count = len(_LATIN_RE.findall(v))
+        if cjk_count > latin_count:
             return False
     # Reject if value is only punctuation/whitespace
     if not re.search(r"\w", v):

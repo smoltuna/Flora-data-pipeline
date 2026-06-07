@@ -74,26 +74,6 @@ async def embed_and_store(
     return results
 
 
-async def embed_all_sources(
-    flower_id: int,
-    embed_provider: EmbeddingProvider,
-    session: AsyncSession,
-) -> list[SourceEmbedding]:
-    """Embed all raw sources for a flower that don't yet have embeddings."""
-    result = await session.execute(
-        select(RawSource).where(RawSource.flower_id == flower_id)
-    )
-    sources = result.scalars().all()
-
-    all_embeddings: list[SourceEmbedding] = []
-    for src in sources:
-        if not src.raw_content and not src.parsed_content:
-            continue
-        embs = await embed_and_store(flower_id, src, embed_provider, session)
-        all_embeddings.extend(embs)
-    return all_embeddings
-
-
 def _build_chunk_text(raw_source: RawSource) -> str:
     """Concatenate available text from a raw source into a single string."""
     parts: list[str] = []

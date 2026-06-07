@@ -27,27 +27,6 @@ class RetrievedChunk:
     embedding: list[float]
 
 
-async def retrieve_for_flower(
-    flower_id: int,
-    session: AsyncSession,
-) -> list[RetrievedChunk]:
-    """Return all embedded chunks for a specific flower (deterministic filter)."""
-    result = await session.execute(
-        select(SourceEmbedding).where(SourceEmbedding.flower_id == flower_id)
-    )
-    rows = result.scalars().all()
-    return [
-        RetrievedChunk(
-            chunk_id=row.id,
-            chunk_text=row.chunk_text,
-            source=(row.metadata_ or {}).get("source", "unknown"),
-            rrf_score=1.0,
-            embedding=list(row.embedding) if row.embedding is not None else [],
-        )
-        for row in rows
-    ]
-
-
 def _source_matches(source: str, source_filter: list[str]) -> bool:
     """Return True if source is included in source_filter.
 
