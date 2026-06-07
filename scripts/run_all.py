@@ -194,7 +194,7 @@ async def main(
     limit: int | None = None,
 ) -> None:
     configure_logging()
-    setup_observability(include_batch_summary=True)
+    setup_observability(include_batch_summary=True, metrics_exporter="otlp_push")
     await create_tables()
 
     if latin_names and not skip_data:

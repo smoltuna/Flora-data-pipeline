@@ -1,24 +1,51 @@
+import asyncio
 from contextlib import asynccontextmanager
 
+import structlog
 from config import settings
-from database import create_tables
+from database import async_session_factory, create_tables
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from log_config import configure_logging
-from opentelemetry import metrics as otel_metrics
-from opentelemetry.exporter.prometheus import PrometheusMetricReader
+from models import Flower
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.sdk.metrics import MeterProvider
 from prometheus_client import make_asgi_app
 from routers import export, flowers
-from services.observability import setup_observability
+from services.observability import register_funnel_gauge, setup_observability
+from sqlalchemy import func, select
+
+log = structlog.get_logger()
+
+# Updated every FUNNEL_REFRESH_S by a background task; read synchronously
+# by the OTel observable gauge callback.
+_funnel_counts: dict[str, int] = {}
+FUNNEL_REFRESH_S = 15.0
+
+
+async def _refresh_funnel_loop() -> None:
+    while True:
+        try:
+            async with async_session_factory() as session:
+                rows = await session.execute(
+                    select(Flower.status, func.count()).group_by(Flower.status)
+                )
+                _funnel_counts.clear()
+                _funnel_counts.update({status: int(n) for status, n in rows.all()})
+        except Exception as exc:
+            log.warning("funnel.refresh_failed", error=str(exc))
+        await asyncio.sleep(FUNNEL_REFRESH_S)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
     await create_tables()
-    yield
+    register_funnel_gauge(lambda: dict(_funnel_counts))
+    task = asyncio.create_task(_refresh_funnel_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 app = FastAPI(
@@ -35,13 +62,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OpenTelemetry — traces (OTLP → Jaeger) + MLflow sink. See services/observability.py.
-setup_observability()
-
-# OpenTelemetry — metrics exported to Prometheus
-_prometheus_reader = PrometheusMetricReader()
-_meter_provider = MeterProvider(metric_readers=[_prometheus_reader])
-otel_metrics.set_meter_provider(_meter_provider)
+# OpenTelemetry — traces (OTLP → Tempo) + metrics (Prometheus pull) + MLflow sink.
+setup_observability(metrics_exporter="prometheus_pull")
 
 FastAPIInstrumentor.instrument_app(app)
 

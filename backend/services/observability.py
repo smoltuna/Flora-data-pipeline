@@ -14,21 +14,143 @@ Public API:
 """
 from __future__ import annotations
 
+import os
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Literal
 
-from opentelemetry import trace
+from opentelemetry import metrics, trace
 from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.metrics import CallbackOptions, Counter, Histogram, Observation
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanProcessor
 from opentelemetry.trace import Span
 
+MetricsExporter = Literal["prometheus_pull", "otlp_push", "none"]
+
 _initialized = False
 _tracer: trace.Tracer | None = None
+_meter_provider: MeterProvider | None = None
+
+# Lazy-init Prometheus instruments — created on first use so the global meter
+# provider (set up by setup_observability) is guaranteed ready.
+_meter_initialized = False
+_pipeline_duration: Histogram | None = None
+_pipelines_completed: Counter | None = None
+_pipelines_failed: Counter | None = None
+_step_duration: Histogram | None = None
+_llm_tokens_total: Counter | None = None
+_llm_calls_total: Counter | None = None
+_field_confidence: Histogram | None = None
+_crag_grades: Counter | None = None
+
+
+def _ensure_meters() -> None:
+    global _meter_initialized, _pipeline_duration, _pipelines_completed, _pipelines_failed
+    global _step_duration, _llm_tokens_total, _llm_calls_total
+    global _field_confidence, _crag_grades
+    if _meter_initialized:
+        return
+    meter = metrics.get_meter("flora-pipeline")
+    _pipeline_duration = meter.create_histogram(
+        "flora_pipeline_duration",
+        unit="s",
+        description="End-to-end pipeline duration per flower",
+    )
+    _pipelines_completed = meter.create_counter(
+        "flora_pipelines_completed",
+        description="Pipelines that reached 'enriched' status",
+    )
+    _pipelines_failed = meter.create_counter(
+        "flora_pipelines_failed",
+        description="Pipelines that ended in 'failed' status",
+    )
+    _step_duration = meter.create_histogram(
+        "flora_pipeline_step_duration",
+        unit="s",
+        description="Per-step pipeline duration (scrape/embed/grade/...)",
+    )
+    _llm_tokens_total = meter.create_counter(
+        "flora_llm_tokens",
+        description="LLM tokens consumed, labelled by step",
+    )
+    _llm_calls_total = meter.create_counter(
+        "flora_llm_calls",
+        description="LLM calls issued, labelled by step",
+    )
+    _field_confidence = meter.create_histogram(
+        "flora_field_confidence",
+        description="Self-RAG verifier confidence per field [0,1]",
+    )
+    _crag_grades = meter.create_counter(
+        "flora_crag_grades",
+        description="CRAG retrieval grade outcomes per field",
+    )
+    _meter_initialized = True
+
+
+def record_pipeline_completion(duration_s: float) -> None:
+    """Record one completed pipeline run."""
+    _ensure_meters()
+    assert _pipeline_duration is not None and _pipelines_completed is not None
+    _pipeline_duration.record(duration_s)
+    _pipelines_completed.add(1)
+
+
+def record_pipeline_failure() -> None:
+    """Record one pipeline run that ended in 'failed' status."""
+    _ensure_meters()
+    assert _pipelines_failed is not None
+    _pipelines_failed.add(1)
+
+
+def record_field_confidence(field: str, score: float) -> None:
+    _ensure_meters()
+    assert _field_confidence is not None
+    _field_confidence.record(score, {"field": field})
+
+
+def record_crag_grade(field: str, grade: str) -> None:
+    """grade ∈ {sufficient, partial, insufficient}."""
+    _ensure_meters()
+    assert _crag_grades is not None
+    _crag_grades.add(1, {"field": field, "grade": grade})
+
+
+def register_funnel_gauge(get_counts: Callable[[], dict[str, int]]) -> None:
+    """Register an observable gauge that reports flower counts by status.
+
+    The callback is invoked synchronously by the OTel SDK on each collection,
+    so get_counts() must be cheap and non-blocking. The caller is responsible
+    for keeping the underlying dict fresh (e.g. via an async background task
+    in the API lifespan).
+    """
+    _ensure_meters()
+    meter = metrics.get_meter("flora-pipeline")
+
+    def _callback(_: CallbackOptions) -> Iterator[Observation]:
+        for status, count in get_counts().items():
+            yield Observation(count, {"status": status})
+
+    meter.create_observable_gauge(
+        "flora_flowers_by_status",
+        callbacks=[_callback],
+        description="Current count of flowers per pipeline status",
+    )
+
+
+def _record_llm_usage(step: str, tokens: int, calls: int) -> None:
+    _ensure_meters()
+    assert _llm_tokens_total is not None and _llm_calls_total is not None
+    if tokens:
+        _llm_tokens_total.add(tokens, {"step": step})
+    if calls:
+        _llm_calls_total.add(calls, {"step": step})
 
 
 class _MLflowSpanProcessor(SpanProcessor):
@@ -142,16 +264,59 @@ class _BatchSummaryProcessor(SpanProcessor):
 batch_summary = _BatchSummaryProcessor()
 
 
-def setup_observability(*, include_batch_summary: bool = False) -> None:
-    """Initialize OTel tracer + sinks. Safe to call multiple times.
+def _build_meter_provider(
+    resource: Resource, mode: MetricsExporter
+) -> MeterProvider | None:
+    """Build a MeterProvider whose reader matches the deployment mode.
+
+    prometheus_pull → PrometheusMetricReader (long-running API; scraped via /metrics).
+    otlp_push       → PeriodicExportingMetricReader → Prometheus OTLP receiver
+                      (short-lived CLI; flushed on shutdown).
+    none            → no MeterProvider; metric calls become no-ops.
+    """
+    if mode == "none":
+        return None
+
+    if mode == "prometheus_pull":
+        from opentelemetry.exporter.prometheus import PrometheusMetricReader
+        return MeterProvider(resource=resource, metric_readers=[PrometheusMetricReader()])
+
+    if mode == "otlp_push":
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
+            OTLPMetricExporter,
+        )
+        endpoint = os.getenv(
+            "PROMETHEUS_OTLP_ENDPOINT",
+            "http://localhost:9090/api/v1/otlp/v1/metrics",
+        )
+        reader = PeriodicExportingMetricReader(
+            OTLPMetricExporter(endpoint=endpoint),
+            export_interval_millis=5_000,
+        )
+        return MeterProvider(resource=resource, metric_readers=[reader])
+
+    raise ValueError(f"Unknown metrics_exporter mode: {mode}")
+
+
+def setup_observability(
+    *,
+    include_batch_summary: bool = False,
+    metrics_exporter: MetricsExporter = "none",
+) -> None:
+    """Initialize OTel tracer + metrics + sinks. Safe to call multiple times.
 
     include_batch_summary=True registers the in-memory aggregator used by the
     CLI summary table. Leave False for long-lived servers (FastAPI).
+
+    metrics_exporter controls how metrics leave the process. The API uses
+    "prometheus_pull"; the CLI uses "otlp_push" so the same counters/histograms
+    reach the same Prometheus regardless of entry point.
     """
-    global _initialized, _tracer
+    global _initialized, _tracer, _meter_provider
     if _initialized:
         return
     resource = Resource.create({"service.name": "flora-pipeline"})
+
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(insecure=True)))
     if include_batch_summary:
@@ -159,6 +324,11 @@ def setup_observability(*, include_batch_summary: bool = False) -> None:
     provider.add_span_processor(_MLflowSpanProcessor())
     trace.set_tracer_provider(provider)
     _tracer = trace.get_tracer("flora-pipeline")
+
+    _meter_provider = _build_meter_provider(resource, metrics_exporter)
+    if _meter_provider is not None:
+        metrics.set_meter_provider(_meter_provider)
+
     _initialized = True
 
 
@@ -170,10 +340,12 @@ def get_tracer() -> trace.Tracer:
 
 
 def shutdown_observability() -> None:
-    """Flush pending OTLP exports."""
+    """Flush pending OTLP exports (traces and metrics)."""
     provider = trace.get_tracer_provider()
     if hasattr(provider, "shutdown"):
         provider.shutdown()
+    if _meter_provider is not None:
+        _meter_provider.shutdown()
 
 
 @contextmanager
@@ -184,10 +356,16 @@ def step_span(name: str) -> Iterator[Span]:
     attaches the totals as span attributes. The counter is module-global, so
     concurrent flowers (asyncio.gather) can bleed token counts across each
     other — pre-existing limitation, not introduced by OTel.
+
+    Also emits the per-step duration histogram and step-labelled token/call
+    counters so dashboards can break work down by stage.
     """
+    import time as _time
+
     from services.llm import _token_counter
 
     _token_counter.read_and_reset()
+    start = _time.perf_counter()
     with get_tracer().start_as_current_span(name) as span:
         try:
             yield span
@@ -197,3 +375,7 @@ def step_span(name: str) -> Iterator[Span]:
                 span.set_attribute("tokens_used", tokens)
             if calls:
                 span.set_attribute("llm_calls", calls)
+            _record_llm_usage(name, tokens, calls)
+            _ensure_meters()
+            assert _step_duration is not None
+            _step_duration.record(_time.perf_counter() - start, {"step": name})

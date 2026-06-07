@@ -28,7 +28,14 @@ from models import Flower, RawSource
 from services.scraper.orchestrator import scrape_all_sources
 from services.embeddings.provider import EmbeddingProvider, get_embedding_provider
 from services.llm.provider import LLMProvider, get_provider
-from services.observability import get_tracer, step_span
+from services.observability import (
+    get_tracer,
+    record_crag_grade,
+    record_field_confidence,
+    record_pipeline_completion,
+    record_pipeline_failure,
+    step_span,
+)
 from services.rag.deduplicator import deduplicate_chunks
 from services.rag.embedder import embed_and_store
 from services.rag.extractor import extract_field_facts
@@ -244,6 +251,7 @@ async def run_pipeline(
                         field_chunks_list, field_cfg, db, grade_llm, embed_provider,
                     )
                     graded_per_field[field_name] = final_chunks  # [] if insufficient
+                    record_crag_grade(field_name, grade)
                     if grade == "partial":
                         log.info("pipeline.crag_partial", field=field_name)
                     elif grade == "insufficient":
@@ -310,6 +318,8 @@ async def run_pipeline(
                 field: {"llm_score": res.confidence}
                 for field, res in verification_results.items()
             }
+            for field, res in verification_results.items():
+                record_field_confidence(field, res.confidence)
 
             # ── Stage 7b: LLM-as-Judge ─────────────────────────────────────
             judge_llm: LLMProvider = get_provider(step="judge")
@@ -373,6 +383,10 @@ async def run_pipeline(
             elapsed = time.perf_counter() - start_time
             if chunks:
                 _log_mlflow_metrics(confidence_scores, len(chunks), len(deduped), elapsed)
+            if flower.status == "enriched":
+                record_pipeline_completion(elapsed)
+            elif flower.status == "failed":
+                record_pipeline_failure()
             log.info(
                 "pipeline.complete",
                 flower_id=flower_id,

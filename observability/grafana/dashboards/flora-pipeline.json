@@ -2,40 +2,343 @@
   "title": "Flora Pipeline",
   "uid": "flora-pipeline",
   "schemaVersion": 38,
-  "refresh": "10s",
-  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
   "panels": [
     {
       "id": 1,
-      "title": "HTTP Request Rate",
-      "type": "timeseries",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 0 },
+      "title": "p95 Pipeline Runtime",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 5, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 200 },
+              { "color": "red", "value": 300 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "textMode": "value",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"] }
+      },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "rate(http_server_duration_milliseconds_count[1m])",
-          "legendFormat": "{{http_route}}"
+          "expr": "histogram_quantile(0.95, sum by (le) (max_over_time(flora_pipeline_duration_seconds_bucket[24h])))",
+          "legendFormat": "p95"
         }
       ]
     },
     {
       "id": 2,
-      "title": "HTTP P95 Latency (ms)",
-      "type": "timeseries",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 0 },
+      "title": "LLM Tokens (24h)",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 5, "x": 5, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "fixed", "fixedColor": "blue" }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "textMode": "value",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"] }
+      },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.95, rate(http_server_duration_milliseconds_bucket[5m]))",
-          "legendFormat": "p95 {{http_route}}"
+          "expr": "sum(max_over_time(flora_llm_tokens_total[24h]))"
         }
       ]
     },
     {
       "id": 3,
-      "title": "Pipeline Runs (flower spans + latin_name)",
+      "title": "LLM Calls (24h)",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 5, "x": 10, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "fixed", "fixedColor": "purple" }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "textMode": "value",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(max_over_time(flora_llm_calls_total[24h]))"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Enriched (24h)",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 5, "x": 15, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "fixed", "fixedColor": "green" }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "textMode": "value",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(max_over_time(flora_pipelines_completed_total[24h]))"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Failed (24h)",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "textMode": "value",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"] }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(max_over_time(flora_pipelines_failed_total[24h]))"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Per-step Avg Duration",
+      "type": "barchart",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "showValue": "auto",
+        "stacking": "none",
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (step) (max_over_time(flora_pipeline_step_duration_seconds_sum[24h])) / sum by (step) (max_over_time(flora_pipeline_step_duration_seconds_count[24h]))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{step}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "LLM Tokens by Step (24h)",
+      "type": "barchart",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "showValue": "auto",
+        "stacking": "none",
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (step) (max_over_time(flora_llm_tokens_total{step!=\"\"}[24h]))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{step}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Field Confidence (avg)",
+      "type": "barchart",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.5 },
+              { "color": "yellow", "value": 0.7 },
+              { "color": "green", "value": 0.85 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "showValue": "auto",
+        "stacking": "none",
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (field) (max_over_time(flora_field_confidence_sum[24h])) / sum by (field) (max_over_time(flora_field_confidence_count[24h]))",
+          "format": "time_series",
+          "instant": true,
+          "legendFormat": "{{field}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Pipeline Funnel (by status)",
+      "type": "barchart",
+      "gridPos": { "h": 9, "w": 8, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "showValue": "auto",
+        "stacking": "none",
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "flora_flowers_by_status",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "CRAG Grades (24h)",
+      "type": "piechart",
+      "gridPos": { "h": 9, "w": 4, "x": 20, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": {
+        "pieType": "donut",
+        "displayLabels": ["name", "percent"],
+        "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (grade) (max_over_time(flora_crag_grades_total[24h]))",
+          "legendFormat": "{{grade}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "LLM Tokens Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 30, "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (step) (rate(flora_llm_tokens_total[5m]))",
+          "legendFormat": "{{step}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "HTTP Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (http_method, http_route) (rate(http_server_duration_milliseconds_count[1m]))",
+          "legendFormat": "{{http_method}} {{http_route}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Pipeline Runs (latest)",
       "type": "table",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 31 },
       "datasource": { "type": "tempo", "uid": "tempo" },
       "targets": [
         {
@@ -43,15 +346,15 @@
           "queryType": "traceql",
           "query": "{ name=\"flower\" } | select(.latin_name, .flower_id)",
           "tableType": "spans",
-          "limit": 50
+          "limit": 30
         }
       ]
     },
     {
-      "id": 4,
-      "title": "Pipeline Step Durations (latest)",
+      "id": 8,
+      "title": "Pipeline Step Durations",
       "type": "table",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 7 },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 31 },
       "datasource": { "type": "tempo", "uid": "tempo" },
       "targets": [
         {
@@ -59,7 +362,7 @@
           "queryType": "traceql",
           "query": "{ name=~\"scrape|embed|retrieve|grade|dedup|extract|synthesize|verify|judge|translate\" }",
           "tableType": "spans",
-          "limit": 50
+          "limit": 100
         }
       ]
     }
