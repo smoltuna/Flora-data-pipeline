@@ -1,6 +1,6 @@
 <h1>
   <img src="screenshots/flora-logo.png" alt="" width="48" align="center">
-  Flora Asset Pipeline
+  Flora Data Pipeline
 </h1>
 
 > Botanical data + image pipeline that ships the daily flower into the [Flora iOS app](https://apps.apple.com/ca/app/flora-flower-of-the-day/id6759986494).
@@ -146,22 +146,6 @@ uv run python scripts/run_all.py --name "Rosa canina" --skip-images
 Output lands in `output/FlowerAssets.xcassets/`, ready to drop into Xcode. Backend Swagger at [localhost:8000/docs](http://localhost:8000/docs), Grafana at [localhost:3001](http://localhost:3001), MLflow at [localhost:5001](http://localhost:5001).
 
 `run_all.py` flags: `--name`, `--file`, `--limit`, `--skip-images`, `--skip-data`.
-
----
-
-## Tech stack
-
-| Layer | Tech |
-|---|---|
-| Backend | Python 3.11+, FastAPI, SQLAlchemy 2 async, Pydantic v2 |
-| Vector DB | PostgreSQL 17 + pgvector (HNSW), Alembic migrations |
-| Embeddings | `nomic-embed-text` via Ollama (768d). OpenAI embeddings also wired. |
-| LLM | Provider-agnostic `LLMProvider` protocol with per-step overrides. Ollama (default), Groq, Together.ai, Gemini. See LLM providers section for model routing. |
-| RAG | CRAG with web correction, Self-RAG, LLM-as-Judge, post-synthesis web fact-check, semantic dedup, hybrid BM25 + dense + RRF, HyDE, multi-query |
-| Image pipeline | Wikimedia Commons, iNaturalist, fal.ai (Qwen3-VL ranking + FLUX Schnell), `rembg` BiRefNet, Pillow |
-| Observability | OpenTelemetry traces → Tempo, RED metrics → Prometheus → Grafana, MLflow runs per flower, structlog JSON logs |
-| Frontend | Next.js 15 App Router, TypeScript, Tailwind |
-| Infra | Docker Compose (Postgres + pgvector, MLflow, Tempo, Prometheus, Grafana, backend, frontend); Ollama runs natively on the host (see Quick start). |
 
 ---
 
